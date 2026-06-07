@@ -28,13 +28,13 @@ from telegram.ext import (
 
 BASE = Path(__file__).parent.parent
 TOKEN_PATH = BASE / "env" / "telegram-token"
-PHRASES_PATH = BASE / "bot-data" / "phrases.json"
+PHRASES_PATH = BASE / "configs" / "phrases.json"
 BOTINFO_PATH = BASE / "info" / "botinfo.md"
 CHANGELOG_PATH = BASE / "info" / "changelog.md"
 COMMANDLIST_PATH = BASE / "info" / "command-list.md"
-SYNONYMS_PATH = BASE / "bot-data" / "synonyms.json"
-SUPERUSERS_PATH = BASE / "bot-data" / "superusers.json"
-RP_COMMANDS_PATH = BASE / "bot-data" / "rp-commands.json"
+SYNONYMS_PATH = BASE / "configs" / "synonyms.json"
+SUPERUSERS_PATH = BASE / "configs" / "superusers.json"
+RP_COMMANDS_PATH = BASE / "configs" / "rp-commands.json"
 
 MAX_TRACKED_MESSAGES = 1000
 DELETE_BATCH_SIZE = 100
@@ -45,6 +45,7 @@ TRIGGER_SPAM_MUTE = 120  # seconds to ignore user after spam
 
 COMMAND_PREFIX = "$"
 CHANCE_TRIGGER = "пибот инфа"
+CHANCE_TRIGGER_EN = "pibot info"
 
 USE_GROQ = True
 USE_GEMINI = False
