@@ -9,6 +9,6 @@
 ---
 
 ## READMEs
-🇷🇺 [Русское README](./README-RU.md)
+🇷🇺 [README на русском](./README-RU.md)
 
 🇬🇧 [English README](./README-EN.md)

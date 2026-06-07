@@ -8,4 +8,4 @@ if [ ! -f .venv/bin/python ]; then
     exit 1
 fi
 
-exec ./.venv/bin/python source/code.py
+exec ./.venv/bin/python src/Main.py
