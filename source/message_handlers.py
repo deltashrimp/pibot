@@ -1,7 +1,8 @@
-import logging
-import random
 import string
+import random
 import time
+import logging
+
 from datetime import datetime, timezone
 
 from telegram import Message, MessageEntity, Update
@@ -14,14 +15,18 @@ from antispam import (
     get_llm_rate_limiter,
     llm_global_limiter,
 )
+
 from auth import (
     get_mention,
     is_banned,
     check_dev_access,
     get_user_rank,
 )
+
+
 from llm_service import ask_llm, llm_client
 from registry import PIBOT_COMMANDS
+
 from storage import (
     _banned_users,
     _phrases,
@@ -43,14 +48,15 @@ from storage import (
     load_text_file,
 )
 
-logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
 STRIP_PUNCT = str.maketrans("", "", string.punctuation)
 
 
 def track_id(context: CallbackContext, message_id: int) -> None:
     message_ids = context.chat_data.setdefault("message_ids", [])
     message_ids.append(message_id)
+    
     if len(message_ids) > MAX_TRACKED_MESSAGES:
         del message_ids[: MAX_TRACKED_MESSAGES // 2]
 
@@ -76,20 +82,21 @@ async def track_all_messages(update: Update, context: CallbackContext) -> None:
     known = context.bot_data.setdefault("known_chats", set())
     known.add(chat_id)
     user = update.message.from_user
+    
     if user and user.username:
         username_map = context.bot_data.setdefault("username_map", {})
         username_map[user.username.lower()] = user.id
 
     if not user or user.is_bot:
         return
+        
     if update.effective_chat.type not in ("group", "supergroup"):
         return
 
     if user.id in _banned_users:
         return
-
-    user_rank = await get_user_rank(update, context, user.id)
-    if user_rank <= RANK_ADMIN:
+    
+    if await get_user_rank(update, context, user.id) <= RANK_ADMIN:
         return
 
     now = time.time()
@@ -107,11 +114,12 @@ async def track_all_messages(update: Update, context: CallbackContext) -> None:
 
     if update.message.text:
         lower = update.message.text.lower().strip().translate(STRIP_PUNCT)
+        
         if lower in _phrases or lower.startswith(CHANCE_TRIGGER):
             return
-        if update.message.reply_to_message:
-            if lower in _rp_commands:
-                return
+            
+        if update.message.reply_to_message and lower in _rp_commands:
+            return
 
     try:
         await context.bot.restrict_chat_member(
@@ -140,13 +148,18 @@ async def _check_banned(update: Update) -> bool:
 async def _check_age(update: Update, text: str) -> bool:
     if not update.message.date:
         return False
+        
     msg_date = update.message.date
+    
     if msg_date.tzinfo is None:
         msg_date = msg_date.replace(tzinfo=timezone.utc)
+        
     msg_age = (datetime.now(timezone.utc) - msg_date).total_seconds()
+    
     if msg_age > MAX_MESSAGE_AGE:
         if not text.lower().startswith("пибот"):
             return True
+            
     return False
 
 
@@ -185,11 +198,14 @@ async def _handle_command(update: Update, context: CallbackContext, text: str) -
 async def _handle_rp(update: Update, context: CallbackContext, lower_text: str) -> bool:
     if not update.message.reply_to_message or not update.message.reply_to_message.from_user:
         return False
+        
     if lower_text not in _rp_commands:
         return False
+        
     if track_trigger_spam(context, update.message.from_user.id, lower_text):
         await safe_reply(update, context, "Ой всё", disable_notification=True)
         return True
+        
     if not await rate_limiter.acquire():
         return True
 
@@ -200,33 +216,38 @@ async def _handle_rp(update: Update, context: CallbackContext, lower_text: str) 
         .replace("{mention1}", user1)
         .replace("{mention2}", user2)
     )
+    
     await safe_reply(update, context, response, disable_notification=True)
     return True
 
 
 def _get_special_response(key: str) -> str:
-    if key == "__botinfo__":
-        return _cached_botinfo or load_text_file(BOTINFO_PATH) or "⚠️ Инфа потерялась, проверь путь к моему описанию"
-    elif key == "__changelog__":
-        return _cached_changelog or load_text_file(CHANGELOG_PATH) or "⚠️ Инфа потерялась, проверь путь к моим обновам"
-    elif key == "__commandlist__":
-        return _cached_commandlist or load_text_file(COMMANDLIST_PATH) or "⚠️ Инфа потерялась, проверь путь к списку команд"
-    return ""
+    match key:
+        case "__botinfo__":
+            return _cached_botinfo or load_text_file(BOTINFO_PATH) or "⚠️ Инфа потерялась, проверь путь к моему описанию"
+        case "__changelog__":
+            return _cached_changelog or load_text_file(CHANGELOG_PATH) or "⚠️ Инфа потерялась, проверь путь к моим обновам"
+        case "__commandlist__":
+            return _cached_commandlist or load_text_file(COMMANDLIST_PATH) or "⚠️ Инфа потерялась, проверь путь к списку команд"
+        case _: 
+            return ""
 
 
 async def _handle_phrase(update: Update, context: CallbackContext, lower_text: str) -> bool:
     if lower_text not in _phrases:
         return False
+        
     if track_trigger_spam(context, update.message.from_user.id, lower_text):
         await safe_reply(update, context, "Ой всё", disable_notification=True)
         return True
+        
     if not await rate_limiter.acquire():
         return True
 
     response = _phrases[lower_text]
     mention = get_mention(update.message.from_user)
-
     special = _get_special_response(response)
+    
     if special:
         response = special
 
@@ -238,11 +259,14 @@ async def _handle_phrase(update: Update, context: CallbackContext, lower_text: s
 async def _handle_chance(update: Update, context: CallbackContext, lower_text: str) -> bool:
     if not lower_text.startswith(CHANCE_TRIGGER):
         return False
+        
     if track_trigger_spam(context, update.message.from_user.id, lower_text):
         await safe_reply(update, context, "Ой всё", disable_notification=True)
         return True
+        
     if not await rate_limiter.acquire():
         return True
+        
     n = random.randint(0, 100)
     await safe_reply(
         update,
@@ -250,23 +274,29 @@ async def _handle_chance(update: Update, context: CallbackContext, lower_text: s
         f"Я думаю, что вероятность {n}%",
         disable_notification=True,
     )
+    
     return True
 
 
 async def _handle_llm(update: Update, context: CallbackContext, text: str) -> bool:
     if not llm_client:
         return False
+        
     if update.message.from_user.id == context.bot.id:
         return False
 
+        # Ge tout bruh (fck u bih)
     is_mentioned = False
     if update.effective_chat.type == "private":
         is_mentioned = True
+        
     elif update.message.entities:
         bot_username = context.bot.username
         for entity in update.message.entities:
+            
             if entity.type == MessageEntity.MENTION:
                 mention = text[entity.offset : entity.offset + entity.length]
+                
                 if mention.lower() == f"@{bot_username.lower()}":
                     is_mentioned = True
                     break
@@ -276,33 +306,40 @@ async def _handle_llm(update: Update, context: CallbackContext, text: str) -> bo
 
     if not await llm_global_limiter.acquire():
         return True
+        
     if not await get_llm_rate_limiter(update.effective_chat.id).acquire():
         return True
 
     chat_history = context.chat_data.setdefault("llm_history", [])
     history = list(chat_history)
     clean_text = text
+    
     if update.message.entities:
         for entity in sorted(
             update.message.entities, key=lambda e: e.offset, reverse=True
         ):
+            
             if entity.type == MessageEntity.MENTION:
                 clean_text = (
                     clean_text[: entity.offset]
                     + clean_text[entity.offset + entity.length :]
                 )
+                
     clean_text = clean_text.strip()
     if not clean_text:
         return True
 
     history.append({"role": "user", "content": clean_text})
     response_text = await ask_llm(history[-LLM_HISTORY_LIMIT:])
+    
     if response_text and response_text.startswith("__API_ERR"):
         parts = response_text.split(":", 1)
         msg = "API не доступен"
+        
         if len(parts) > 1 and parts[1]:
             msg += f" ({parts[1]})"
         await safe_reply(update, context, msg, disable_notification=True)
+        
     elif response_text:
         history.append({"role": "assistant", "content": response_text})
         context.chat_data["llm_history"] = history[-LLM_HISTORY_LIMIT:]
