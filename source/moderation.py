@@ -13,7 +13,9 @@ from auth import (
     get_mention,
     resolve_user,
 )
+
 from registry import pibot_command
+
 from storage import (
     _banned_users,
     _cached_botinfo,
@@ -34,6 +36,7 @@ from storage import (
     NO_PERMISSIONS,
     ALL_PERMISSIONS,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,7 @@ async def handle_nuke(update: Update, context: CallbackContext, params: str) -> 
 
     for i in range(0, len(ids_to_delete), DELETE_BATCH_SIZE):
         batch = ids_to_delete[i : i + DELETE_BATCH_SIZE]
+        
         try:
             await context.bot.delete_messages(chat_id=chat_id, message_ids=batch)
         except Exception as e:
@@ -142,6 +146,7 @@ async def handle_ban(update: Update, context: CallbackContext, params: str) -> N
 
     target_str = params[8:].strip()
     target = await resolve_user(update, context, target_str)
+    
     if not target:
         await safe_reply(
             update, context, "⚠️ Кого банить? Ответь на сообщение или укажи @username"
@@ -167,6 +172,7 @@ async def handle_ban(update: Update, context: CallbackContext, params: str) -> N
 @pibot_command("верни", 1)
 async def handle_unban(update: Update, context: CallbackContext, params: str) -> None:
     target = await resolve_user(update, context, params)
+    
     if not target:
         await safe_reply(
             update,
@@ -179,12 +185,15 @@ async def handle_unban(update: Update, context: CallbackContext, params: str) ->
         await context.bot.unban_chat_member(
             update.effective_chat.id, target.id, only_if_banned=True
         )
+        
         async with ban_lock:
             _banned_users.discard(target.id)
             save_banned_users(_banned_users)
+            
         await safe_reply(
             update, context, f"✅️ {get_mention(target)} возвращён из гулага"
         )
+        
     except Exception as e:
         await safe_reply(update, context, f"⚠️ Ошибка разбана: {e}")
 
