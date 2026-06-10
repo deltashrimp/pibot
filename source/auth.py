@@ -1,27 +1,20 @@
 import logging
 
-
 from telegram import (
-
     MessageEntity,
     Update,
     User,
-
 )
-
 
 from telegram.constants import ChatMemberStatus
 from telegram.ext import CallbackContext
 
-
 from storage import (
-
     _banned_users,
     _dev_ids,
     RANK_OWNER,
     RANK_ADMIN,
     RANK_MEMBER,
-
 )
 
 
