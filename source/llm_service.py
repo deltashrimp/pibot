@@ -1,15 +1,11 @@
-import os, logging
-
+import os 
+import logging
 
 from openai import AsyncOpenAI
-
-
 from storage import GROQ_KEY_PATH, PERSONALITY_PATH
 
 
 logger = logging.getLogger(__name__)
-
-
 llm_client: AsyncOpenAI | None = None
 personality_prompt: str = ""
 
