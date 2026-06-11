@@ -1,0 +1,9 @@
+services:
+  pibot:
+    build: .
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - GROQ_KEY=${GROQ_KEY}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

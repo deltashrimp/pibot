@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import random
 import string
 import sys
@@ -11,7 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from openai import AsyncOpenAI
+from dotenv import load_dotenv
+from openai import AsyncOpenAI, RateLimitError, APITimeoutError, APIConnectionError
 from persistence import SQLitePersistence
 from telegram import (
     Chat,
@@ -32,7 +34,6 @@ from telegram.ext import (
 logger = logging.getLogger(__name__)
 
 BASE = Path(__file__).parent.parent
-TOKEN_PATH = BASE / "env" / "telegram-token"
 PHRASES_PATH = BASE / "bot-data" / "phrases.json"
 BOTINFO_PATH = BASE / "bot-data" / "botinfo.md"
 CHANGELOG_PATH = BASE / "bot-data" / "changelog.md"
@@ -47,6 +48,7 @@ TRIGGER_SPAM_WINDOW = 60
 TRIGGER_SPAM_LIMIT = 5
 TRIGGER_SPAM_MUTE = 120
 LLM_HISTORY_LIMIT = 20
+CHAT_CONTEXT_LIMIT = 10
 ANTISPAM_WINDOW = 1.0
 ANTISPAM_MSG_LIMIT = 5
 ANTISPAM_MUTE_THRESHOLD = 9
@@ -55,7 +57,6 @@ PIBOT_PREFIX = "пибот "
 PIBOT_PREFIX_LEN = len(PIBOT_PREFIX)
 
 CHANCE_TRIGGER = "пибот инфа"
-GROQ_KEY_PATH = BASE / "env" / "groq-key"
 PERSONALITY_PATH = BASE / "bot-data" / "personality.md"
 
 RANK_OWNER = 1
@@ -298,7 +299,7 @@ class PiBot:
         else:
             logger.warning("personality.md не найден. ИИ выключен")
         try:
-            groq_key = GROQ_KEY_PATH.read_text(encoding="utf-8").strip()
+            groq_key = os.getenv("GROQ_KEY", "")
             if groq_key and groq_key != "YOUR-GROQ-API-KEY-HERE":
                 self.llm_client = AsyncOpenAI(
                     api_key=groq_key, base_url="https://api.groq.com/openai/v1"
@@ -333,8 +334,14 @@ class PiBot:
             chat_data.pop("llm_history", None)
         if app.job_queue:
             app.job_queue.run_repeating(self._cleanup_caches, interval=3600, first=3600)
+        for dev_id in self.dev_ids:
+            try:
+                await app.bot.send_message(dev_id, "✅ PiBot запущен")
+            except Exception as e:
+                logger.warning("[post_init] Не удалось уведомить разработчика %s: %s", dev_id, e)
 
     def run(self) -> None:
+        asyncio.set_event_loop(asyncio.new_event_loop())
         self.app.run_polling(drop_pending_updates=True)
 
     def _get_msg_lock(self, chat_id: int) -> asyncio.Lock:
@@ -375,7 +382,6 @@ class PiBot:
     async def ask_llm(self, history: list[dict]) -> str:
         if not self.personality_prompt or self.llm_client is None:
             return ""
-        last_error: Optional[Exception] = None
         for attempt in range(3):
             try:
                 response = await self.llm_client.chat.completions.create(
@@ -384,35 +390,41 @@ class PiBot:
                     + history,
                     max_tokens=300,
                     temperature=0.9,
-                    timeout=60,
+                    timeout=15,
                 )
                 return response.choices[0].message.content.strip()
+            except RateLimitError:
+                wait = 2 ** attempt
+                logger.warning("[LLM] rate limited, retrying in %ds", wait)
+                await asyncio.sleep(wait)
+            except APITimeoutError:
+                if attempt == 2:
+                    return "⚠️ AI временно недоступен, попробуй позже."
+                logger.warning("[LLM] timeout, retrying...")
+                await asyncio.sleep(1)
+            except APIConnectionError:
+                if attempt == 2:
+                    return "⚠️ AI временно недоступен, попробуй позже."
+                logger.warning("[LLM] connection error, retrying...")
+                await asyncio.sleep(1)
             except Exception as e:
-                last_error = e
+                logger.error(
+                    "[LLM error] %s: %s", type(e).__name__, e, exc_info=True
+                )
                 code = (
                     getattr(e, "status_code", None)
                     or getattr(e, "code", None)
                     or getattr(e, "status", None)
                 )
-                if code in (429, 500, 502, 503, 504):
-                    wait = 2**attempt
-                    logger.warning(
-                        "[LLM] retrying in %ds after %s", wait, type(e).__name__
-                    )
+                if code in (500, 502, 503, 504):
+                    wait = 2 ** attempt
+                    logger.warning("[LLM] server error %s, retrying in %ds", code, wait)
                     await asyncio.sleep(wait)
                 else:
-                    break
-        logger.error(
-            "[LLM error] %s: %s", type(last_error).__name__, last_error, exc_info=True
-        )
-        code = (
-            getattr(last_error, "status_code", None)
-            or getattr(last_error, "code", None)
-            or getattr(last_error, "status", None)
-        )
-        if code:
-            return f"__API_ERR:{code}"
-        return "__API_ERR"
+                    if code:
+                        return f"__API_ERR:{code}"
+                    return "__API_ERR"
+        return "⚠️ Не удалось получить ответ от AI."
 
     async def track_all_messages(
         self, update: Update, context: CallbackContext
@@ -428,6 +440,12 @@ class PiBot:
         if user and user.username:
             username_map = context.bot_data.setdefault("username_map", {})
             username_map[user.username.lower()] = user.id
+
+        if update.message.text and update.effective_chat.type in ("group", "supergroup") and user:
+            sender = f"@{user.username}" if user.username else (user.first_name or "Unknown")
+            ctx = context.chat_data.setdefault("chat_context", [])
+            ctx.append(f"{sender} says: {update.message.text}")
+            context.chat_data["chat_context"] = ctx[-CHAT_CONTEXT_LIMIT:]
 
         if not user or user.is_bot:
             return
@@ -1063,6 +1081,10 @@ class PiBot:
 
         chat_history = context.chat_data.setdefault("llm_history", [])
         history = list(chat_history)
+        if update.effective_chat.type in ("group", "supergroup"):
+            chat_context = context.chat_data.get("chat_context", [])
+            if chat_context:
+                history.append({"role": "system", "content": "Recent chat:\n" + "\n".join(chat_context)})
         clean_text = text
         if update.message.entities:
             for entity in sorted(
@@ -1102,12 +1124,35 @@ class PiBot:
                 del self.llm_rate_limiters[cid]
 
 
-def main() -> None:
-    token = TOKEN_PATH.read_text(encoding="utf-8").strip()
+def load_config() -> dict[str, str]:
+    token = os.getenv("TELEGRAM_TOKEN", "")
+    groq_key = os.getenv("GROQ_KEY", "")
+
     if not token or token == "YOUR-TELEGRAM-TOKEN":
+        raise ValueError(
+            "❌ Токен не настроен!\n"
+            "Вставьте токен в .env (TELEGRAM_TOKEN) (получить у @BotFather)"
+        )
+    if not groq_key or groq_key == "YOUR-GROQ-API-KEY-HERE":
+        raise ValueError(
+            "❌ Groq API ключ не настроен!\n"
+            "Вставьте ключ в .env (GROQ_KEY) (получить на console.groq.com)"
+        )
+
+    return {"token": token, "groq_key": groq_key}
+
+
+def main() -> None:
+    load_dotenv(BASE / ".env")
+
+    try:
+        cfg = load_config()
+    except ValueError as e:
         logging.basicConfig(level=logging.INFO)
-        logger.error("Пожалуйста вставьте токен бота в telegram-token")
+        logger.error(e)
         return
+
+    token = cfg["token"]
 
     sys.path.insert(0, str(BASE / "important"))
     from logging_settings import setup_logging  # type: ignore[import-untyped]

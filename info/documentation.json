@@ -4,7 +4,7 @@
     "language": "Python 3.10+",
     "framework": "python-telegram-bot v22+",
     "main_file": "source/pibot.py",
-    "lines": 1119,
+    "lines": 1156,
     "llm_backend": "Groq (Llama 3.3 70B via OpenAI SDK)",
     "persistence": {
       "system": "SQLite",
@@ -32,8 +32,6 @@
     "env": {
       "description": "Untracked config files (gitignored)",
       "files": {
-        "telegram-token": "Bot token",
-        "groq-key": "Groq API key",
         "dev-ids.json": "Developer IDs for elevated commands (int[])"
       }
     },
@@ -50,31 +48,37 @@
     "important": {
       "description": "Internal tooling (gitignored)",
       "files": {
-        "logging_settings.py": "Custom logging with colorized console output, token censoring, file handler",
+        "logging_settings.py": "Custom logging with colorized console, token censoring, file handler, JSONFormatter",
         "code-review.md": "Code review notes",
         "logs/": "Runtime log files"
       }
     },
     "source": {
-      "pibot.py": "Main bot code (1119 lines, class PiBot)",
+      "pibot.py": "Main bot code (1156 lines, class PiBot)",
       "persistence.py": "SQLite persistence implementation (172 lines)"
     },
-    "config_files": {
-      "pyproject.toml": "mypy config",
+    "root_config_files": {
+      ".env.example": "Environment variable template (TELEGRAM_TOKEN, GROQ_KEY)",
+      ".env": "Environment variables (gitignored, created by setup.sh from .env.example)",
+      "Dockerfile": "Python 3.11-slim based container image",
+      "docker-compose.yml": "Docker Compose with env vars and persistent volume",
+      "pibot.service": "systemd unit for production deployment",
+      "pyproject.toml": "Project config: dependencies, mypy, pytest",
       "setup.sh": "Deployment script",
       "launchbot.sh": "Launch script",
-      "requirements.txt": "Python dependencies"
+      "requirements.txt": "Python dependencies with pinned exact versions"
     }
   },
   "architecture": {
     "class_based": true,
     "main_class": "PiBot",
     "initialization": {
-      "token": "Read from env/telegram-token",
+      "token": "Read from TELEGRAM_TOKEN env var (from .env via python-dotenv)",
+      "groq_key": "Read from GROQ_KEY env var (from .env via python-dotenv)",
       "phrases": "Loaded from bot-data/phrases.json into self.phrases",
       "rp_commands": "Loaded from bot-data/rp-phrases.json into self.rp_commands",
       "dev_ids": "Loaded from env/dev-ids.json into self.dev_ids",
-      "llm": "Initialized via self._init_llm() — reads personality.md and groq-key",
+      "llm": "Initialized via self._init_llm() — reads personality.md and checks GROQ_KEY env var",
       "commands": "Registered in self._register_commands() — populates self.commands dict"
     }
   },
@@ -85,7 +89,7 @@
     "4_rp_commands": "If reply message and text matches key in rp-phrases.json, format and respond via PiBot._handle_rp().",
     "5_trigger_phrases": "Exact match in phrases.json (supports __botinfo__, __changelog__, __commandlist__ via SPECIAL_RESPONSES dict). Handled by PiBot._handle_phrase().",
     "6_chance_trigger": "Messages starting with 'пибот инфа' return random 0-100. Handled by PiBot._handle_chance().",
-    "7_ai_response": "If @bot_username mentioned, send chat context to Groq LLM via PiBot._handle_llm(). 60s timeout, retry up to 3x on 429/5xx with exponential backoff."
+    "7_ai_response": "If @bot_username mentioned, send chat context to Groq LLM via PiBot._handle_llm(). 15s timeout, retry up to 3x on RateLimitError/APITimeoutError/APIConnectionError/5xx with exponential backoff or graceful fallback messages."
   },
   "command_system": {
     "prefix": "пибот <subcommand>",
@@ -252,13 +256,33 @@
     "backend": "Groq",
     "model": "llama-3.3-70b-versatile",
     "api": "OpenAI-compatible SDK (AsyncOpenAI)",
+    "key_source": "GROQ_KEY environment variable (loaded from .env via python-dotenv)",
     "personality_file": "bot-data/personality.md",
     "trigger": "Reply to any message with @bot_username mention, or any message in private chat",
     "context": "Last 20 messages from chat_data['llm_history'] (trimmed at startup in post_init)",
     "max_tokens": 300,
     "temperature": 0.9,
-    "timeout_seconds": 60,
-    "retry": "3 attempts with exponential backoff (1s, 2s, 4s) on HTTP 429, 500, 502, 503, 504"
+    "timeout_seconds": 15,
+    "retry": {
+      "attempts": 3,
+      "strategy": {
+        "RateLimitError": "Exponential backoff 2^attempt seconds, then retry",
+        "APITimeoutError": "Wait 1s, retry; on 3rd attempt return 'AI временно недоступен'",
+        "APIConnectionError": "Wait 1s, retry; on 3rd attempt return 'AI временно недоступен'",
+        "5xx (500, 502, 503, 504)": "Exponential backoff 2^attempt seconds, then retry",
+        "other": "Return __API_ERR:[code] immediately"
+      }
+    },
+    "error_handling": "Specific openai exception types (RateLimitError, APITimeoutError, APIConnectionError) caught before generic Exception. User-facing messages on final failure."
+  },
+  "startup_config": {
+    "method": "load_dotenv() + load_config() in main()",
+    "env_file": ".env at project root",
+    "validation": {
+      "TELEGRAM_TOKEN": "Must be non-empty and not equal to placeholder 'YOUR-TELEGRAM-TOKEN'",
+      "GROQ_KEY": "Must be non-empty and not equal to placeholder 'YOUR-GROQ-API-KEY-HERE'"
+    },
+    "error_behavior": "ValueError with user-friendly message in Russian, exit without starting bot"
   },
   "typing": {
     "tool": "mypy",
@@ -266,6 +290,16 @@
     "disallow_untyped_defs": true,
     "suppressed": ["ignore_missing_imports"],
     "reason": "PTB types many attributes as Optional; code handles None at runtime"
+  },
+  "testing": {
+    "framework": "pytest",
+    "config": "pyproject.toml [tool.pytest.ini_options]",
+    "asyncio_mode": "auto"
+  },
+  "deployment": {
+    "bare_metal": "setup.sh + launchbot.sh",
+    "docker": "docker compose up -d (uses Dockerfile)",
+    "systemd": "sudo cp pibot.service /etc/systemd/system/ && sudo systemctl enable --now pibot"
   },
   "key_global_variables": {
     "MAX_TRACKED_MESSAGES": 1000,
@@ -334,12 +368,13 @@
       "_cleanup_caches": "Hourly job: remove stale entries from self.msg_locks and self.llm_rate_limiters",
       "_resolve_by_username": "Helper: lookup username in username_map, return User or None",
       "_strip_gulag_prefix": "Helper: strip 'в гулаг ' or 'вгулаг ' prefix, return remaining string or None",
-      "_strip_gulag_prefix": "Helper: strip 'в гулаг ' or 'вгулаг ' prefix from params for handle_ban",
       "resolve_user": "Resolve @username, text mention, or reply target to User object",
       "is_user_ignored": "Check if user is in trigger-spam timeout period",
       "track_trigger_spam": "Track trigger phrase frequency with sliding window, return True if limit exceeded",
-      "ask_llm": "Call Groq with system prompt + history. 60s timeout, 3 retries on 429/5xx with exponential backoff.",
-      "_read_text_file_async": "Generic async text file reader for botinfo/changelog/commandlist"
+      "ask_llm": "Call Groq with system prompt + history. 15s timeout, 3 retries on RateLimitError/APITimeoutError/APIConnectionError/5xx. Graceful fallback messages.",
+      "_read_text_file_async": "Generic async text file reader for botinfo/changelog/commandlist",
+      "load_config": "Validate TELEGRAM_TOKEN and GROQ_KEY from env vars at startup",
+      "main": "Entry point: load_dotenv, load_config, setup_logging, create PiBot, run"
     }
   }
 }

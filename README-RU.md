@@ -17,12 +17,16 @@
 ```
 pibot/
 ├── bot-data/         # JSON/MD файлы данных (phrases, rp-commands, personality)
-├── env/              # Файлы конфигов (gitignored: токены, ключи, ID разработчиков)
+├── env/              # ID разработчиков (gitignored)
 ├── info/             # Документация и справка
 ├── important/        # Настройка логирования и утилиты (gitignored)
 ├── source/
-│   ├── pibot.py      # Основной код бота (класс, ~1120 строк)
+│   ├── pibot.py      # Основной код бота (класс, ~1150 строк)
 │   └── persistence.py # SQLite persistence
+├── .env.example      # Шаблон переменных окружения
+├── Dockerfile        # Контейнеризация
+├── docker-compose.yml # Docker Compose
+├── pibot.service     # systemd unit
 ├── setup.sh          # Скрипт развёртывания
 └── launchbot.sh      # Скрипт запуска
 ```
@@ -30,11 +34,26 @@ pibot/
 ## Установка
 
 1. Скопировать репозиторий на сервер
-2. Запустить `bash setup.sh` — создаст файлы конфигов, venz и установит зависимости
-3. Вставить токен бота в `env/telegram-token` (получить у BotFather)
-4. Вставить Groq API ключ в `env/groq-key`
-5. Опционально настроить `bot-data/personality.md` и `bot-data/botinfo.md`
-6. Запустить `./launchbot.sh`
+2. Запустить `bash setup.sh` — создаст файлы конфигов, venv и установит зависимости
+3. Вставить токен бота и Groq API ключ в `.env` (TELEGRAM_TOKEN, GROQ_KEY)
+4. Опционально настроить `bot-data/personality.md` и `bot-data/botinfo.md`
+5. Запустить `./launchbot.sh`
+
+### Docker
+
+```bash
+docker compose up -d
+```
+
+### systemd
+
+```bash
+sudo cp pibot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable pibot
+sudo systemctl start pibot
+# Логи: journalctl -u pibot -f
+```
 
 ## Команды
 
@@ -42,5 +61,6 @@ pibot/
 
 ## Зависимости
 
-- python-telegram-bot (v22+, с job-queue)
-- openai (AsyncOpenAI для Groq API)
+- python-telegram-bot (v22.7, с job-queue)
+- openai (v1.70.0, AsyncOpenAI для Groq API)
+- python-dotenv (v1.0.1)

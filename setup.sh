@@ -25,15 +25,13 @@ EOF
 echo -e "Создание файлов с ключами...\n"
 
 mkdir -p ./env/
-touch ./env/telegram-token ./env/groq-key
 echo "[]" > ./env/dev-ids.json
 
-echo "YOUR-TELEGRAM-TOKEN" > ./env/telegram-token
-echo "YOUR-GROQ-API-KEY-HERE" > ./env/groq-key
+cp .env.example .env
 
 echo -e "------------------------------------------------\n"
-echo -e "[WARNING]: Вставьте токен бота в env/telegram-token (получить у BotFather)\n"
-echo -e "[WARNING]: Вставьте API ключ в env/groq-key\n"
+echo -e "[WARNING]: Вставьте токен бота в .env (TELEGRAM_TOKEN) (получить у BotFather)\n"
+echo -e "[WARNING]: Вставьте API ключ в .env (GROQ_KEY)\n"
 echo -e "Вы можете настроить свои фразы в bot-data/phrases.json\n"
 echo -e "Отредактируйте bot-data/botinfo.md чтобы изменить сообщение о боте\n"
 echo -e "Отредактируйте bot-data/personality.md чтобы изменить поведение ИИ\n"

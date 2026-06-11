@@ -1,4 +1,4 @@
-# PiBot
+# 🛠️ PiBot
 
 Telegram group moderation and interactive response bot. Supports English and Russian.
 
@@ -6,9 +6,16 @@ Telegram group moderation and interactive response bot. Supports English and Rus
 
 <img src="https://img.shields.io/github/issues/deltashrimp/pibot.svg?style=for-the-badge"> <img src="https://img.shields.io/github/last-commit/deltashrimp/pibot.svg?style=for-the-badge"> <img src="https://img.shields.io/badge/Maintained%3F-yes-green.svg?style=for-the-badge">
 
+<img src="https://img.shields.io/badge/Audi-BB0A30?logo=audi&logoColor=fff&style=for-the-badge"> <img src="https://img.shields.io/badge/KFC-F40027?style=for-the-badge&logo=kfc&logoColor=white">
+
 ---
 
 ## READMEs
-:ru: [README на русском](./README-RU.md)
+🇷🇺 [README на русском](./README-RU.md)
 
-:gb: [README in English](./README-EN.md)
+🇬🇧 [README in English](./README-EN.md)
+
+---
+## Changelogs
+
+📜 [Full changelog](./info/full-changelog.md)

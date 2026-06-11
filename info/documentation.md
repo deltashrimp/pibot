@@ -15,8 +15,6 @@ pibot/
 │   ├── changelog.md            # Вывод по "пибот обновы"
 │   └── public-botinfo.md       # Шаблон botinfo.md для setup.sh
 ├── env/                        # Неотслеживаемые конфиги (gitignored)
-│   ├── telegram-token          # Токен бота
-│   ├── groq-key                # API ключ Groq
 │   └── dev-ids.json            # ID разработчиков (int[])
 ├── info/                       # Документация и справка
 │   ├── command-list.md         # Список команд (вывод по "пибот команды")
@@ -25,16 +23,21 @@ pibot/
 │   ├── full-changelog.md       # Полный список изменений
 │   └── future-features.md      # Планируемые функции
 ├── important/                  # Внутренние утилиты (gitignored)
-│   ├── logging_settings.py     # Логирование: цветной вывод, цензура токена, файл
+│   ├── logging_settings.py     # Логирование: цветной вывод, цензура токена, файл, JSONFormatter
 │   ├── code-review*.md         # Результаты ревью кода
 │   └── logs/                   # Файлы логов
 ├── source/
-│   ├── pibot.py                # Основной код бота (класс PiBot, ~1119 строк)
+│   ├── pibot.py                # Основной код бота (класс PiBot, ~1156 строк)
 │   └── persistence.py          # SQLite persistence (BasePersistence, 172 строки)
-├── pyproject.toml              # Конфигурация mypy
+├── .env                        # Переменные окружения (gitignored, создаётся setup.sh)
+├── .env.example                # Шаблон переменных окружения
+├── Dockerfile                  # Контейнеризация
+├── docker-compose.yml          # Docker Compose
+├── pibot.service               # systemd unit
+├── pyproject.toml              # Конфигурация проекта и mypy
 ├── setup.sh                    # Скрипт развёртывания
 ├── launchbot.sh                # Скрипт запуска
-├── requirements.txt            # Зависимости
+├── requirements.txt            # Зависимости (точные версии)
 ├── README.md                   # Главный README
 ├── README-EN.md                # README на английском
 └── README-RU.md                # README на русском
@@ -120,11 +123,23 @@ pibot/
 ## AI-функции
 
 - Groq (Llama 3.3 70B Versatile) через OpenAI-совместимый SDK
+- Ключ API читается из переменной окружения `GROQ_KEY` (из `.env` файла)
 - Системный промпт из `bot-data/personality.md`
 - При @упоминании бота или в личных сообщениях — контекст в LLM
 - Rate limit: 3 вызова в минуту на чат
-- Timeout: 60 секунд
-- Retry: до 3 попыток с экспоненциальной задержкой (1с, 2с, 4с) на 429/5xx
+- Timeout: 15 секунд
+- Retry: до 3 попыток:
+  - `RateLimitError` (429) — экспоненциальная задержка (2^attempt секунд)
+  - `APITimeoutError` / `APIConnectionError` — 1 секунда, на 3-й попытке возвращает "AI временно недоступен"
+  - 5xx ошибки — экспоненциальная задержка (2^attempt секунд)
+  - Остальные ошибки — немедленный возврат `__API_ERR:[code]`
+
+## Конфигурация при старте
+
+Перед запуском `main()` вызывает `load_dotenv()`, затем `load_config()`:
+- Читает `TELEGRAM_TOKEN` и `GROQ_KEY` из переменных окружения
+- Проверяет, что токен и ключ не пусты и не равны placeholder-значениям
+- При ошибке выводит понятное сообщение и завершает работу
 
 ## Антиспам
 
@@ -160,7 +175,18 @@ Sliding window: 5 вызовов/сек. При превышении сообщ�
 - Цензура токена бота в логах (замена на `-BOT-TOKEN-HERE-`)
 - Файловый лог `info/logs.log` с почасовой ротацией, записываются все уровни кроме INFO
 - `StatusCodeHandler` для uvicorn — переопределяет уровень на ERROR при 5xx и WARNING при 4xx
+- `JSONFormatter` — форматирование логов в JSON для интеграции с системами сбора логов
 
 ## Типизация (mypy)
 
 Проект аннотирован. Конфигурация в `pyproject.toml`: strict=false, disallow_untyped_defs=true.
+
+## Тестирование
+
+pytest настроен в `pyproject.toml` с `asyncio_mode = "auto"`.
+
+## Контейнеризация
+
+- `Dockerfile` — образ на основе python:3.11-slim
+- `docker-compose.yml` — сервис с переменными окружения и volume для данных
+- `pibot.service` — systemd unit для управления через systemctl
