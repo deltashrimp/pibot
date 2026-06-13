@@ -10,7 +10,6 @@ ExecStart=/opt/pibot/.venv/bin/python source/pibot.py
 Restart=always
 RestartSec=10
 Environment="TELEGRAM_TOKEN=your_token"
-Environment="GROQ_KEY=your_key"
 
 [Install]
 WantedBy=multi-user.target

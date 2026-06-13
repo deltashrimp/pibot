@@ -16,20 +16,18 @@ source/bot_data.db
 bot_data.db
 
 # Log files
-important/logs/
-info/logs.log
+logs/
 *.log
 
 # Sensitive project files
 isthisalis-home-adress.md
 sex-with-ramses666.mp4
-**/opencode-sessions/
+**/opencode/
 
-bot-data/personality-public.md
 bot-data/phrases.json
 bot-data/personality.md
 bot-data/banned-users.json
-
-source/pibot.py.BACKUP.txt
-important/
-source/pibot-backup.py.md
+bot-data/botinfo.md
+bot-data/dev-commands.md
+info/documentation.md
+info/documentation.json

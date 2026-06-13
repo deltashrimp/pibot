@@ -4,7 +4,6 @@ import logging
 import os
 import random
 import string
-import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -12,24 +11,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from dotenv import load_dotenv
-from openai import AsyncOpenAI, RateLimitError, APITimeoutError, APIConnectionError
-from persistence import SQLitePersistence
-from telegram import (
+from aiogram import BaseMiddleware, Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatMemberStatus, MessageEntityType, ParseMode
+from aiogram.types import (
+    CallbackQuery,
     Chat,
     ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Message,
-    MessageEntity,
-    Update,
+    TelegramObject,
     User,
 )
-from telegram.constants import ChatMemberStatus
-from telegram.ext import (
-    Application,
-    CallbackContext,
-    MessageHandler,
-    filters,
-)
+from dotenv import load_dotenv
+from groq import AsyncGroq, RateLimitError
+from logging_settings import setup_logging
+from openai import AsyncOpenAI
+from persistence import SQLitePersistence
 
 logger = logging.getLogger(__name__)
 
@@ -40,24 +39,25 @@ CHANGELOG_PATH = BASE / "bot-data" / "changelog.md"
 COMMANDLIST_PATH = BASE / "info" / "command-list.md"
 RP_COMMANDS_PATH = BASE / "bot-data" / "rp-phrases.json"
 DEV_IDS_PATH = BASE / "env" / "dev-ids.json"
+PERSONALITY_PATH = BASE / "bot-data" / "personality.md"
+DEVCOMMANDS_PATH = BASE / "bot-data" / "dev-commands.md"
+
+AI_MAX_HISTORY = 20
+GROQ_MODEL = "llama-3.3-70b-versatile"
+OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
 
 MAX_TRACKED_MESSAGES = 1000
 DELETE_BATCH_SIZE = 100
 MAX_MESSAGE_AGE = 120
-TRIGGER_SPAM_WINDOW = 60
+TRIGGER_SPAM_WINDOW = 10
 TRIGGER_SPAM_LIMIT = 5
-TRIGGER_SPAM_MUTE = 120
-LLM_HISTORY_LIMIT = 20
-CHAT_CONTEXT_LIMIT = 10
+TRIGGER_SPAM_MUTE = 60
 ANTISPAM_WINDOW = 1.0
 ANTISPAM_MSG_LIMIT = 5
 ANTISPAM_MUTE_THRESHOLD = 9
 ANTISPAM_MUTE_DURATION = 60
 PIBOT_PREFIX = "пибот "
 PIBOT_PREFIX_LEN = len(PIBOT_PREFIX)
-
-CHANCE_TRIGGER = "пибот инфа"
-PERSONALITY_PATH = BASE / "bot-data" / "personality.md"
 
 RANK_OWNER = 1
 RANK_ADMIN_PLUS = 2
@@ -103,9 +103,11 @@ SPECIAL_RESPONSES = {
         COMMANDLIST_PATH,
         "⚠️ Инфа потерялась, проверь путь к списку команд",
     ),
+    # "__devcommands__": (
+    #     DEVCOMMANDS_PATH,
+    #     "⚠️ Инфа потерялась, проверь путь к моим обновам",
+    # ),
 }
-
-GULAG_PREFIXES = ("в гулаг ", "вгулаг ")
 
 STRIP_PUNCT = str.maketrans("", "", string.punctuation)
 
@@ -135,6 +137,41 @@ class RateLimiter:
             return False
 
 
+class AIBackend:
+    def __init__(
+        self,
+        name: str,
+        display_name: str,
+        client: Any | None,
+        model: str,
+        rate_limit_error: type[Exception] | None = None,
+    ) -> None:
+        self.name = name
+        self.display_name = display_name
+        self.client = client
+        self.model = model
+        self._rate_limit_error = rate_limit_error
+
+    @property
+    def enabled(self) -> bool:
+        return self.client is not None
+
+    async def generate(self, messages: list[dict]) -> str:
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,  # type: ignore[arg-type]
+                temperature=0.7,
+                max_tokens=512,
+            )
+            return response.choices[0].message.content or "⚠️ ИИ ничего не ответил"
+        except Exception as e:
+            if self._rate_limit_error and isinstance(e, self._rate_limit_error):
+                raise
+            logger.error("[%s] API error: %s", self.name, e, exc_info=True)
+            raise
+
+
 def load_phrases() -> dict[str, str]:
     if PHRASES_PATH.exists():
         with open(PHRASES_PATH, encoding="utf-8") as f:
@@ -160,8 +197,8 @@ def get_mention(user: User) -> str:
     return f"@{user.username}" if user.username else (user.first_name or "User")
 
 
-def is_user_ignored(context: CallbackContext, user_id: int) -> bool:
-    ignored = context.chat_data.get("ignored_until", {})
+def is_user_ignored(chat_data: dict, user_id: int) -> bool:
+    ignored = chat_data.get("ignored_until", {})
     expiry = ignored.get(user_id)
     if expiry is None:
         return False
@@ -171,46 +208,45 @@ def is_user_ignored(context: CallbackContext, user_id: int) -> bool:
     return True
 
 
-def track_trigger_spam(context: CallbackContext, user_id: int, phrase: str) -> bool:
+def track_trigger_spam(chat_data: dict, user_id: int, phrase: str) -> bool:
     now = time.time()
-    trackers = context.chat_data.setdefault("trigger_spam", {})
+    trackers = chat_data.setdefault("trigger_spam", {})
     user_tracker = trackers.setdefault(user_id, {})
     timestamps = user_tracker.setdefault(phrase, [])
     cutoff = now - TRIGGER_SPAM_WINDOW
     timestamps[:] = [t for t in timestamps if t > cutoff]
     timestamps.append(now)
     if len(timestamps) > TRIGGER_SPAM_LIMIT:
-        ignored = context.chat_data.setdefault("ignored_until", {})
+        ignored = chat_data.setdefault("ignored_until", {})
         ignored[user_id] = now + TRIGGER_SPAM_MUTE
         return True
     return False
 
 
-async def get_user_rank(update: Update, context: CallbackContext, user_id: int) -> int:
+async def get_user_rank(chat: Chat, chat_data: dict, user_id: int) -> int:
     try:
-        member = await update.effective_chat.get_member(user_id)
-        if member.status == ChatMemberStatus.OWNER:
+        member = await chat.get_member(user_id)
+        if member.status == ChatMemberStatus.CREATOR:
             return RANK_OWNER
         if member.status == ChatMemberStatus.ADMINISTRATOR:
             return RANK_ADMIN
     except Exception:
         pass
-
-    ranks = context.chat_data.setdefault("ranks", {})
+    ranks = chat_data.setdefault("ranks", {})
     return ranks.get(user_id, RANK_MEMBER)
 
 
 async def target_immune_to_mkb(
-    update: Update, context: CallbackContext, target_user_id: int
+    chat: Chat, chat_data: dict, target_user_id: int
 ) -> bool:
-    rank = await get_user_rank(update, context, target_user_id)
+    rank = await get_user_rank(chat, chat_data, target_user_id)
     return rank <= RANK_ADMIN
 
 
 async def _resolve_by_username(
-    username: str, context: CallbackContext, chat: Chat
+    username: str, bot_data: dict, chat: Chat
 ) -> Optional[User]:
-    username_map = context.bot_data.get("username_map", {})
+    username_map = bot_data.get("username_map", {})
     if username in username_map:
         user_id = username_map[username]
         try:
@@ -222,277 +258,131 @@ async def _resolve_by_username(
 
 
 async def resolve_user(
-    update: Update, context: CallbackContext, params: str
+    message: Message, bot_data: dict, chat: Chat, params: str
 ) -> Optional[User]:
-    if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        return update.message.reply_to_message.from_user
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user
 
-    chat = update.effective_chat
-    if update.message.entities:
-        for entity in update.message.entities:
-            if entity.type == MessageEntity.TEXT_MENTION:
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == MessageEntityType.TEXT_MENTION:
                 return entity.user
-            elif entity.type == MessageEntity.MENTION:
+            elif entity.type == MessageEntityType.MENTION:
                 start = entity.offset
                 end = entity.offset + entity.length
-                mention_text = update.message.text[start:end]
+                mention_text = message.text[start:end]
                 username = mention_text[1:].lower()
-                result = await _resolve_by_username(username, context, chat)
+                result = await _resolve_by_username(username, bot_data, chat)
                 if result:
                     return result
 
     if params:
         username = params.strip().lstrip("@").lower()
-        result = await _resolve_by_username(username, context, chat)
+        result = await _resolve_by_username(username, bot_data, chat)
         if result:
             return result
 
     return None
 
 
-def _strip_gulag_prefix(text: str) -> Optional[str]:
-    for prefix in GULAG_PREFIXES:
-        if text.startswith(prefix):
-            return text[len(prefix) :].strip()
-    return None
+class PiBotMiddleware(BaseMiddleware):
+    def __init__(self, pibot: "PiBot") -> None:
+        self.pibot = pibot
 
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Any],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if not isinstance(event, Message):
+            return await handler(event, data)
+        persistence = self.pibot.persistence
+        chat_id = event.chat.id
 
-class PiBot:
-    def __init__(self, token: str) -> None:
-        self.phrases = load_phrases()
-        self.rp_commands = load_rp_commands()
-        self.dev_ids = load_dev_ids()
+        if chat_id not in persistence.chat_data:
+            persistence.chat_data[chat_id] = {}
 
-        self.banned_users: set[int] = set()
+        chat_data = persistence.chat_data[chat_id]
+        bot_data = persistence.bot_data
 
-        self.llm_client: Optional[AsyncOpenAI] = None
-        self.personality_prompt = ""
-        self._init_llm()
+        data["chat_data"] = chat_data
+        data["bot_data"] = bot_data
+        data["_persistence"] = persistence
 
-        self.msg_locks: dict[int, asyncio.Lock] = {}
-        self.llm_rate_limiters: dict[int, RateLimiter] = {}
-        self.rate_limiter = RateLimiter(max_calls=5, period=1.0)
+        ids = chat_data.setdefault("message_ids", deque())
+        ids.append(event.message_id)
+        while len(ids) > MAX_TRACKED_MESSAGES:
+            ids.popleft()
 
-        self.commands: dict[str, CommandConfig] = {}
-        self._register_commands()
-
-        persistence: SQLitePersistence = SQLitePersistence(
-            db_path=Path(__file__).parent / "bot_data.db"
-        )
-        self.app = (
-            Application.builder()
-            .token(token)
-            .persistence(persistence)
-            .post_init(self.post_init)
-            .build()
-        )
-        self.app.add_handler(
-            MessageHandler(filters.ALL, self.track_all_messages), group=-1
-        )
-        self.app.add_handler(MessageHandler(filters.ALL, self.handle_message))
-
-    def _init_llm(self) -> None:
-        if PERSONALITY_PATH.exists():
-            self.personality_prompt = PERSONALITY_PATH.read_text(
-                encoding="utf-8"
-            ).strip()
-        else:
-            logger.warning("personality.md не найден. ИИ выключен")
-        try:
-            groq_key = os.getenv("GROQ_KEY", "")
-            if groq_key and groq_key != "YOUR-GROQ-API-KEY-HERE":
-                self.llm_client = AsyncOpenAI(
-                    api_key=groq_key, base_url="https://api.groq.com/openai/v1"
-                )
-        except Exception as e:
-            logger.error("[Init] Groq client error: %s", e, exc_info=True)
-
-    def _register_commands(self) -> None:
-        self.commands["сотри"] = CommandConfig(handler=self.handle_nuke, value=2)
-        self.commands["кикни"] = CommandConfig(handler=self.handle_kick, value=2)
-        self.commands["кинь"] = CommandConfig(handler=self.handle_ban, value=1)
-        self.commands["выкинь"] = CommandConfig(handler=self.handle_ban, value=1)
-        self.commands["верни"] = CommandConfig(handler=self.handle_unban, value=1)
-        self.commands["заблокируй"] = CommandConfig(
-            handler=self.handle_block, value=0, dev_only=True
-        )
-        self.commands["мут"] = CommandConfig(handler=self.handle_mute, value=3)
-        self.commands["размут"] = CommandConfig(handler=self.handle_unmute, value=3)
-        self.commands["ранг"] = CommandConfig(handler=self.handle_rank, value=1)
-        self.commands["био"] = CommandConfig(handler=self.handle_botinfo_cmd, value=4)
-        self.commands["обновы"] = CommandConfig(
-            handler=self.handle_changelog_cmd, value=4
-        )
-        self.commands["команды"] = CommandConfig(
-            handler=self.handle_commands_cmd, value=4
-        )
-        self.commands["ранги"] = CommandConfig(handler=self.handle_rank_list, value=4)
-
-    async def post_init(self, app: Application) -> None:
-        self.banned_users = set(app.bot_data.get("banned_users", []))
-        for chat_data in app.chat_data.values():
-            chat_data.pop("llm_history", None)
-        if app.job_queue:
-            app.job_queue.run_repeating(self._cleanup_caches, interval=3600, first=3600)
-        for dev_id in self.dev_ids:
-            try:
-                await app.bot.send_message(dev_id, "✅ PiBot запущен")
-            except Exception as e:
-                logger.warning("[post_init] Не удалось уведомить разработчика %s: %s", dev_id, e)
-
-    def run(self) -> None:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        self.app.run_polling(drop_pending_updates=True)
-
-    def _get_msg_lock(self, chat_id: int) -> asyncio.Lock:
-        if chat_id not in self.msg_locks:
-            self.msg_locks[chat_id] = asyncio.Lock()
-        return self.msg_locks[chat_id]
-
-    def _get_llm_rate_limiter(self, chat_id: int) -> RateLimiter:
-        if chat_id not in self.llm_rate_limiters:
-            self.llm_rate_limiters[chat_id] = RateLimiter(max_calls=3, period=60.0)
-        return self.llm_rate_limiters[chat_id]
-
-    async def _read_text_file_async(self, path: Path) -> str:
-        if await asyncio.to_thread(path.exists):
-            return await asyncio.to_thread(path.read_text, encoding="utf-8")
-        return ""
-
-    async def track_id(
-        self, context: CallbackContext, chat_id: int, message_id: int
-    ) -> None:
-        async with self._get_msg_lock(chat_id):
-            ids = context.chat_data.setdefault("message_ids", deque())
-            ids.append(message_id)
-            while len(ids) > MAX_TRACKED_MESSAGES:
-                ids.popleft()
-
-    async def safe_reply(
-        self, update: Update, context: CallbackContext, text: str, **kwargs: Any
-    ) -> Optional[Message]:
-        try:
-            sent = await update.message.reply_text(text, **kwargs)
-            await self.track_id(context, update.effective_chat.id, sent.message_id)
-            return sent
-        except Exception as e:
-            logger.warning("[safe_reply] Failed to send message: %s", e)
-            return None
-
-    async def ask_llm(self, history: list[dict]) -> str:
-        if not self.personality_prompt or self.llm_client is None:
-            return ""
-        for attempt in range(3):
-            try:
-                response = await self.llm_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "system", "content": self.personality_prompt}]
-                    + history,
-                    max_tokens=300,
-                    temperature=0.9,
-                    timeout=15,
-                )
-                return response.choices[0].message.content.strip()
-            except RateLimitError:
-                wait = 2 ** attempt
-                logger.warning("[LLM] rate limited, retrying in %ds", wait)
-                await asyncio.sleep(wait)
-            except APITimeoutError:
-                if attempt == 2:
-                    return "⚠️ AI временно недоступен, попробуй позже."
-                logger.warning("[LLM] timeout, retrying...")
-                await asyncio.sleep(1)
-            except APIConnectionError:
-                if attempt == 2:
-                    return "⚠️ AI временно недоступен, попробуй позже."
-                logger.warning("[LLM] connection error, retrying...")
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.error(
-                    "[LLM error] %s: %s", type(e).__name__, e, exc_info=True
-                )
-                code = (
-                    getattr(e, "status_code", None)
-                    or getattr(e, "code", None)
-                    or getattr(e, "status", None)
-                )
-                if code in (500, 502, 503, 504):
-                    wait = 2 ** attempt
-                    logger.warning("[LLM] server error %s, retrying in %ds", code, wait)
-                    await asyncio.sleep(wait)
-                else:
-                    if code:
-                        return f"__API_ERR:{code}"
-                    return "__API_ERR"
-        return "⚠️ Не удалось получить ответ от AI."
-
-    async def track_all_messages(
-        self, update: Update, context: CallbackContext
-    ) -> None:
-        if not update.message:
-            return
-
-        chat_id = update.effective_chat.id
-        await self.track_id(context, chat_id, update.message.message_id)
-        known = context.bot_data.setdefault("known_chats", set())
+        known = bot_data.setdefault("known_chats", set())
         known.add(chat_id)
-        user = update.message.from_user
+
+        user = event.from_user
         if user and user.username:
-            username_map = context.bot_data.setdefault("username_map", {})
+            username_map = bot_data.setdefault("username_map", {})
             username_map[user.username.lower()] = user.id
 
-        if update.message.text and update.effective_chat.type in ("group", "supergroup") and user:
-            sender = f"@{user.username}" if user.username else (user.first_name or "Unknown")
-            ctx = context.chat_data.setdefault("chat_context", [])
-            ctx.append(f"{sender} says: {update.message.text}")
-            context.chat_data["chat_context"] = ctx[-CHAT_CONTEXT_LIMIT:]
-
         if not user or user.is_bot:
-            return
-        if update.effective_chat.type not in ("group", "supergroup"):
-            return
+            return await handler(event, data)
 
-        if user.id in self.banned_users:
-            return
+        if event.text and event.chat.type in ("group", "supergroup"):
+            mention = (
+                event.from_user.username
+                or event.from_user.first_name
+                or str(event.from_user.id)
+            )
+            history = self.pibot.chat_history.setdefault(chat_id, [])
+            history.append({"username": mention, "text": event.text})
+            if len(history) > AI_MAX_HISTORY:
+                history[:] = history[-AI_MAX_HISTORY:]
 
-        user_rank = await get_user_rank(update, context, user.id)
+        if event.chat.type not in ("group", "supergroup"):
+            return await handler(event, data)
+
+        if user.id in bot_data.get("banned_users", []):
+            return await handler(event, data)
+
+        user_rank = await get_user_rank(event.chat, chat_data, user.id)
         if user_rank <= RANK_ADMIN:
-            return
+            return await handler(event, data)
 
         now = time.time()
-        spam = context.chat_data.setdefault("spam_tracker", {})
+        spam = chat_data.setdefault("spam_tracker", {})
         ts = spam.setdefault(user.id, [])
         cutoff = now - ANTISPAM_WINDOW
         ts[:] = [t for t in ts if t > cutoff]
         ts.append(now)
 
         if len(ts) <= ANTISPAM_MSG_LIMIT:
-            return
+            return await handler(event, data)
 
-        if update.message.text:
-            lower = update.message.text.lower().strip().translate(STRIP_PUNCT)
-            if lower in self.phrases or lower.startswith(CHANCE_TRIGGER):
-                return
-            if update.message.reply_to_message:
-                if lower in self.rp_commands:
-                    return
+        if event.text:
+            lower = event.text.lower().strip().translate(STRIP_PUNCT)
+            if lower in self.pibot.phrases or lower.startswith(PIBOT_PREFIX + "инфа"):
+                return await handler(event, data)
+            if event.reply_to_message:
+                if lower in self.pibot.rp_commands:
+                    return await handler(event, data)
 
         spammer_name = (
             f"@{user.username}" if user.username else user.first_name or str(user.id)
         )
 
+        bot_instance: Bot = data["bot"]
+
         if len(ts) <= ANTISPAM_MUTE_THRESHOLD:
-            warned = context.chat_data.setdefault("spam_warned", {})
+            warned = chat_data.setdefault("spam_warned", {})
             if user.id not in warned:
                 warned[user.id] = now
-                await context.bot.send_message(
+                await bot_instance.send_message(
                     chat_id=chat_id,
                     text=f"⚠️ {spammer_name}, пожалуйста, не флуди!",
                 )
-            return
+            return None
 
         try:
-            await context.bot.restrict_chat_member(
+            await bot_instance.restrict_chat_member(
                 chat_id,
                 user.id,
                 permissions=NO_PERMISSIONS,
@@ -500,20 +390,444 @@ class PiBot:
             )
         except Exception as e:
             logger.warning("[AntiSpam] не получилось замутить: %s", e)
-            return
+            return await handler(event, data)
 
-        await context.bot.send_message(
+        await bot_instance.send_message(
             chat_id=chat_id,
             text=f"✅️ Я замутил {spammer_name} за спам.",
         )
+        return None
+
+
+class PiBot:
+    def __init__(self, token: str, groq_key: str = "", openrouter_key: str = "") -> None:
+        self.phrases = load_phrases()
+        self.rp_commands = load_rp_commands()
+        self.dev_ids = load_dev_ids()
+
+        self.banned_users: set[int] = set()
+
+        self.msg_locks: dict[int, asyncio.Lock] = {}
+        self.rate_limiter = RateLimiter(max_calls=5, period=1.0)
+
+        self.commands: dict[str, CommandConfig] = {}
+        self._register_commands()
+
+        self.persistence = SQLitePersistence(
+            db_path=Path(__file__).parent / "bot_data.db"
+        )
+
+        self.bot = Bot(
+            token=token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+        self.dp = Dispatcher()
+
+        self.dp["persistence"] = self.persistence
+        self.dp["pibot"] = self
+
+        self.dp.message.middleware(PiBotMiddleware(self))
+
+        self.dp.startup.register(self._on_startup)
+        self.dp.shutdown.register(self._on_shutdown)
+
+        self.dp.message()(self.handle_message)
+        self.dp.callback_query(lambda c: c.data and c.data.startswith("aichange:"))(
+            self._handle_ai_change
+        )
+
+        self.bot_id: int = 0
+        self.bot_username: str = ""
+
+        # AI providers
+        self.providers: dict[str, AIBackend] = {}
+        self.personality: str = self._load_personality()
+        if not self.personality:
+            logger.warning("AI: personality.md не найден, используется заглушка")
+            self.personality = (
+                "Ты — Пибот, 25-летняя томбой. Отвечай коротко и по делу."
+            )
+        self.conversation_history: dict[int, list[dict]] = {}
+        self.chat_history: dict[int, list[dict]] = {}
+        self.ai_limiter = RateLimiter(max_calls=2, period=60.0)
+        self._init_providers(groq_key, openrouter_key)
+
+    def _init_providers(self, groq_key: str, openrouter_key: str) -> None:
+        groq_client = AsyncGroq(api_key=groq_key) if groq_key else None
+        self.providers["groq"] = AIBackend(
+            name="groq",
+            display_name="Groq",
+            client=groq_client,
+            model=GROQ_MODEL,
+            rate_limit_error=RateLimitError,
+        )
+
+        or_client = (
+            AsyncOpenAI(
+                api_key=openrouter_key,
+                base_url="https://openrouter.ai/api/v1",
+            )
+            if openrouter_key
+            else None
+        )
+        self.providers["openrouter"] = AIBackend(
+            name="openrouter",
+            display_name="OpenRouter",
+            client=or_client,
+            model=OPENROUTER_MODEL,
+        )
+
+        enabled = [p for p in self.providers.values() if p.enabled]
+        logger.info(
+            "AI: инициализировано %d провайдеров" if enabled else "AI: ни один провайдер не настроен",
+            len(enabled),
+        )
+
+    def _ensure_ai_provider(self) -> None:
+        name = self.persistence.bot_data.get("llm_provider", "")
+        if name in self.providers and self.providers[name].enabled:
+            return
+        for p in self.providers.values():
+            if p.enabled:
+                self.persistence.bot_data["llm_provider"] = p.name
+                break
+
+    def _get_current_provider(self, bot_data: dict) -> AIBackend | None:
+        name = bot_data.get("llm_provider", "")
+        provider = self.providers.get(name)
+        if provider and provider.enabled:
+            return provider
+        for p in self.providers.values():
+            if p.enabled:
+                return p
+        return None
+
+    def _register_commands(self) -> None:
+        self.commands["сотри"] = CommandConfig(self.handle_nuke, 2)
+        self.commands["кикни"] = CommandConfig(self.handle_kick, 2)
+        self.commands["кинь в гулаг"] = CommandConfig(self.handle_ban, 1)
+        self.commands["верни"] = CommandConfig(self.handle_unban, 1)
+        self.commands["заблокируй"] = CommandConfig(self.handle_block, 0, dev_only=True)
+        self.commands["разблокируй"] = CommandConfig(self.handle_unblock, 0, dev_only=True)
+        self.commands["мут"] = CommandConfig(self.handle_mute, 3)
+        self.commands["размут"] = CommandConfig(self.handle_unmute, 3)
+        self.commands["ранг"] = CommandConfig(self.handle_rank, 1)
+        self.commands["био"] = CommandConfig(self.handle_botinfo_cmd, 4)
+        self.commands["обновы"] = CommandConfig(self.handle_changelog_cmd, 4)
+        self.commands["команды"] = CommandConfig(self.handle_commands_cmd, 4)
+        # self.commands["дев команды"] = CommandConfig(self.handle_devcommands_cmd, 4)
+        self.commands["ранги"] = CommandConfig(self.handle_rank_list, 4)
+        self.commands["инфа"] = CommandConfig(self.handle_chance_cmd, 4)
+        self.commands["все чаты"] = CommandConfig(
+            self.handle_all_chats, 0, dev_only=True
+        )
+        self.commands["ии"] = CommandConfig(
+            self.handle_ai_cmd, 0, dev_only=True
+        )
+        self.commands["очистка бд"] = CommandConfig(
+            self.handle_clear_db, 0, dev_only=True
+        )
+
+    async def _on_startup(self) -> None:
+        await self.persistence.load_all()
+        self.banned_users = set(self.persistence.bot_data.get("banned_users", []))
+        self._ensure_ai_provider()
+        bot_user = await self.bot.me()
+        self.bot_id = bot_user.id
+        self.bot_username = bot_user.username.lower() if bot_user.username else ""
+        asyncio.create_task(self._periodic_cleanup())
+        for dev_id in self.dev_ids:
+            try:
+                await self.bot.send_message(dev_id, "✅ PiBot запущен")
+            except Exception as e:
+                logger.warning(
+                    "[_on_startup] Не удалось уведомить разработчика %s: %s",
+                    dev_id,
+                    e,
+                )
+
+    async def _on_shutdown(self) -> None:
+        await self.persistence.flush()
+
+    async def _periodic_cleanup(self) -> None:
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                await self._cleanup_caches()
+            except Exception as e:
+                logger.warning("[cleanup] %s", e)
+
+    def run(self) -> None:
+        asyncio.run(self.dp.start_polling(self.bot))
+
+    def _get_msg_lock(self, chat_id: int) -> asyncio.Lock:
+        if chat_id not in self.msg_locks:
+            self.msg_locks[chat_id] = asyncio.Lock()
+        return self.msg_locks[chat_id]
+
+    async def _read_text_file_async(self, path: Path) -> str:
+        if await asyncio.to_thread(path.exists):
+            return await asyncio.to_thread(path.read_text, encoding="utf-8")
+        return ""
+
+    async def track_id(self, chat_data: dict, chat_id: int, message_id: int) -> None:
+        async with self._get_msg_lock(chat_id):
+            ids = chat_data.setdefault("message_ids", deque())
+            ids.append(message_id)
+            while len(ids) > MAX_TRACKED_MESSAGES:
+                ids.popleft()
+
+    async def safe_reply(
+        self, message: Message, text: str, **kwargs: Any
+    ) -> Optional[Message]:
+        try:
+            sent = await message.answer(
+                text, reply_to_message_id=message.message_id, **kwargs
+            )
+            return sent
+        except Exception as e:
+            logger.warning("[safe_reply] Failed to send message: %s", e)
+            return None
+
+    async def handle_message(
+        self, message: Message, chat_data: dict, bot_data: dict
+    ) -> None:
+        if not self._pre_check(message, chat_data, bot_data):
+            return
+        text = message.text.strip()
+        if await self._handle_command(message, chat_data, bot_data, text):
+            return
+        if is_user_ignored(chat_data, message.from_user.id):
+            return
+        lower_text = text.lower().translate(STRIP_PUNCT)
+        if await self._handle_rp(message, chat_data, lower_text):
+            return
+        if await self._handle_phrase(message, chat_data, lower_text):
+            return
+        await self._handle_ai(message, chat_data, bot_data)
+
+    def _pre_check(self, message: Message, chat_data: dict, bot_data: dict) -> bool:
+        if not message.text:
+            return False
+        user = message.from_user
+        if user and user.id in bot_data.get("banned_users", []):
+            return False
+        if message.date:
+            msg_date = message.date
+            if msg_date.tzinfo is None:
+                msg_date = msg_date.replace(tzinfo=timezone.utc)
+            msg_age = (datetime.now(timezone.utc) - msg_date).total_seconds()
+            if msg_age > MAX_MESSAGE_AGE:
+                if not message.text.lower().startswith(PIBOT_PREFIX):
+                    return False
+        return True
+
+    async def _handle_command(
+        self, message: Message, chat_data: dict, bot_data: dict, text: str
+    ) -> bool:
+        lower = text.lower()
+        if not lower.startswith(PIBOT_PREFIX):
+            return False
+        rest = text[PIBOT_PREFIX_LEN:].strip()
+        if not rest:
+            return False
+
+        words = rest.split()
+        subcommand = ""
+        params = rest
+        for i in range(len(words), 0, -1):
+            candidate = " ".join(words[:i]).lower()
+            if candidate in self.commands:
+                subcommand = candidate
+                params = " ".join(words[i:])
+                break
+        if not subcommand:
+            subcommand = words[0].lower()
+            params = " ".join(words[1:])
+
+        if subcommand not in self.commands:
+            return False
+
+        cmd = self.commands[subcommand]
+        user_id = message.from_user.id
+
+        if cmd.dev_only:
+            if user_id not in self.dev_ids:
+                await self.safe_reply(message, "⛔️ Недостаточно прав для этой команды")
+                return True
+        else:
+            user_rank = await get_user_rank(message.chat, chat_data, user_id)
+            if user_rank > cmd.value:
+                await self.safe_reply(message, "⛔️ Недостаточно прав для этой команды")
+                return True
+
+        await cmd.handler(message, chat_data, bot_data, params)
+        return True
+
+    async def _handle_rp(
+        self, message: Message, chat_data: dict, lower_text: str
+    ) -> bool:
+        if not (message.reply_to_message and message.reply_to_message.from_user):
+            return False
+        if lower_text not in self.rp_commands:
+            return False
+
+        if track_trigger_spam(chat_data, message.from_user.id, lower_text):
+            await self.safe_reply(message, "Ой всё", disable_notification=True)
+            return True
+        if not await self.rate_limiter.acquire():
+            return True
+
+        user1 = get_mention(message.from_user)
+        user2 = get_mention(message.reply_to_message.from_user)
+        response = (
+            self.rp_commands[lower_text]
+            .replace("{mention1}", user1)
+            .replace("{mention2}", user2)
+        )
+        await self.safe_reply(message, response, disable_notification=True)
+        return True
+
+    async def _handle_phrase(
+        self, message: Message, chat_data: dict, lower_text: str
+    ) -> bool:
+        if lower_text not in self.phrases:
+            return False
+
+        if track_trigger_spam(chat_data, message.from_user.id, lower_text):
+            await self.safe_reply(message, "Ой всё", disable_notification=True)
+            return True
+        if not await self.rate_limiter.acquire():
+            return True
+
+        response = self.phrases[lower_text]
+        mention = get_mention(message.from_user)
+
+        if response in SPECIAL_RESPONSES:
+            path, fallback = SPECIAL_RESPONSES[response]
+            response = await self._read_text_file_async(path) or fallback
+
+        response = response.replace("{mention}", mention)
+        await self.safe_reply(message, response, disable_notification=True)
+        return True
+
+    def _load_personality(self) -> str:
+        if PERSONALITY_PATH.exists():
+            try:
+                return PERSONALITY_PATH.read_text(encoding="utf-8")
+            except Exception as e:
+                logger.warning("Не удалось прочитать personality.md: %s", e)
+        return ""
+
+    async def _is_bot_mentioned(self, message: Message) -> bool:
+        if not message.entities:
+            return False
+        for entity in message.entities:
+            if entity.type == MessageEntityType.MENTION:
+                mention = message.text[entity.offset : entity.offset + entity.length]
+                if mention[1:].lower() == self.bot_username:
+                    return True
+            elif entity.type == MessageEntityType.TEXT_MENTION:
+                if entity.user and entity.user.id == self.bot_id:
+                    return True
+        return False
+
+    def _strip_mention(self, message: Message) -> str:
+        text = message.text
+        if not message.entities:
+            return text.strip()
+        for entity in sorted(message.entities, key=lambda e: e.offset, reverse=True):
+            if entity.type == MessageEntityType.MENTION:
+                mention = text[entity.offset : entity.offset + entity.length]
+                if mention[1:].lower() == self.bot_username:
+                    text = text[: entity.offset] + text[entity.offset + entity.length :]
+            elif entity.type == MessageEntityType.TEXT_MENTION:
+                if entity.user and entity.user.id == self.bot_id:
+                    text = text[: entity.offset] + text[entity.offset + entity.length :]
+        return text.strip()
+
+    def _build_ai_messages(self, message: Message, query: str) -> list[dict]:
+        messages = [{"role": "system", "content": self.personality}]
+
+        if message.chat.type == "private":
+            history = self.conversation_history.get(message.chat.id, [])
+            messages.extend(history)
+        else:
+            history = self.chat_history.get(message.chat.id, [])
+            context_lines = [
+                f"@{entry['username']} said: {entry['text']}"
+                for entry in history[-AI_MAX_HISTORY:]
+            ]
+            if context_lines:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "Recent chat history:\n" + "\n".join(context_lines),
+                    }
+                )
+
+        messages.append({"role": "user", "content": query})
+        return messages
+
+    async def _handle_ai(
+        self, message: Message, chat_data: dict, bot_data: dict
+    ) -> None:
+        provider = self._get_current_provider(bot_data)
+        if not provider or not provider.enabled:
+            return
+
+        if message.chat.type in ("group", "supergroup"):
+            if not await self._is_bot_mentioned(message):
+                return
+
+        if not await self.ai_limiter.acquire():
+            await self.safe_reply(
+                message,
+                "⚠️ Есть такая штука. Лимит вызовов AI API называется. Пока что 2 раза в минуту ",
+            )
+            return
+
+        query = (
+            self._strip_mention(message)
+            if message.chat.type in ("group", "supergroup")
+            else message.text.strip()
+        )
+        if not query:
+            return
+
+        ai_messages = self._build_ai_messages(message, query)
+
+        try:
+            answer = await provider.generate(ai_messages)
+        except RateLimitError:
+            logger.warning("[%s] 429 Rate Limit", provider.name)
+            await self.safe_reply(
+                message,
+                "⚠️ Ты достиг лимита апи, задрот",
+            )
+            return
+        except Exception as e:
+            logger.error("[%s] API error: %s", provider.name, e, exc_info=True)
+            await self.safe_reply(message, "⚠️ Ошибка при обращении к ИИ")
+            return
+
+        if message.chat.type == "private":
+            history = self.conversation_history.setdefault(message.chat.id, [])
+            history.append({"role": "user", "content": query})
+            history.append({"role": "assistant", "content": answer})
+
+        await self.safe_reply(message, answer, disable_notification=True)
 
     async def handle_nuke(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
         if not params:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "Использование: пибот сотри n, где n - целое положительное число",
             )
             return
@@ -524,17 +838,16 @@ class PiBot:
                 raise ValueError
         except ValueError:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "Использование: пибот сотри n, где n - целое положительное число",
             )
             return
 
-        chat_id = update.effective_chat.id
+        chat_id = message.chat.id
         async with self._get_msg_lock(chat_id):
-            ids = context.chat_data.setdefault("message_ids", deque())
+            ids = chat_data.setdefault("message_ids", deque())
             if not ids:
-                await self.safe_reply(update, context, "⚠️ Не найдено сообщений")
+                await self.safe_reply(message, "⚠️ Не найдено сообщений")
                 return
 
             n = min(n, len(ids)) + 1
@@ -542,7 +855,7 @@ class PiBot:
             ids_to_delete.reverse()
 
         if not ids_to_delete:
-            await self.safe_reply(update, context, "⚠️ Нет сообщений для удаления")
+            await self.safe_reply(message, "⚠️ Нет сообщений для удаления")
             return
 
         total = len(ids_to_delete)
@@ -550,145 +863,166 @@ class PiBot:
         for i in range(0, total, DELETE_BATCH_SIZE):
             batch = ids_to_delete[i : i + DELETE_BATCH_SIZE]
             try:
-                await context.bot.delete_messages(chat_id=chat_id, message_ids=batch)
+                await message.bot.delete_messages(chat_id=chat_id, message_ids=batch)
                 deleted += len(batch)
             except Exception as e:
                 logger.warning(
-                    "[Nuke] не удалось удалить %d сообщений: %s", len(batch), e
+                    "[Nuke] не удалось удалить %d сообщений: %s",
+                    len(batch),
+                    e,
                 )
 
-        # Бот удаляет сообщение и потом пытается на него ответить
-        # if deleted > 0:
-        #     await self.safe_reply(update, context, f"✅️ Удалено {deleted} сообщений")
-        # else:
-        #     await self.safe_reply(update, context, "⚠️ Не удалось удалить сообщения")
-        #
         if deleted == 0:
-            await self.safe_reply(update, context, "⚠️ Не удалось удалить сообщения")
+            await self.safe_reply(message, "⚠️ Не удалось удалить сообщения")
 
     async def handle_kick(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
-        target = await resolve_user(update, context, params)
+        target = await resolve_user(message, bot_data, message.chat, params)
         if not target:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "⚠️ Кого вышвырнуть? Ответь на сообщение или укажи @username",
             )
             return
 
-        if await target_immune_to_mkb(update, context, target.id):
-            await self.safe_reply(
-                update, context, "⛔️ Этого пользователя нельзя кикнуть"
-            )
+        if await target_immune_to_mkb(message.chat, chat_data, target.id):
+            await self.safe_reply(message, "⛔️ Этого пользователя нельзя кикнуть")
             return
 
         try:
-            await context.bot.ban_chat_member(update.effective_chat.id, target.id)
-            await context.bot.unban_chat_member(update.effective_chat.id, target.id)
-            await self.safe_reply(
-                update, context, f"✅️ {get_mention(target)} выкинут за борт"
-            )
+            await message.bot.ban_chat_member(message.chat.id, target.id)
+            await message.bot.unban_chat_member(message.chat.id, target.id)
+            await self.safe_reply(message, f"✅️ {get_mention(target)} выкинут за борт")
         except Exception as e:
-            await self.safe_reply(update, context, f"⚠️ Ошибка кика: {e}")
+            await self.safe_reply(message, f"⚠️ Ошибка кика: {e}")
 
     async def handle_ban(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
-        target_str = _strip_gulag_prefix(params)
-        if target_str is None:
-            target = await resolve_user(update, context, params)
-            if target is None:
-                await self.safe_reply(
-                    update,
-                    context,
-                    "Использование: пибот выкинь @user",
-                )
-                return
-        else:
-            target = await resolve_user(update, context, target_str)
+        target = await resolve_user(message, bot_data, message.chat, params)
         if not target:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "⚠️ Кого банить? Ответь на сообщение или укажи @username",
             )
             return
 
-        if await target_immune_to_mkb(update, context, target.id):
-            await self.safe_reply(
-                update, context, "⛔️ Этого пользователя нельзя забанить"
-            )
+        if await target_immune_to_mkb(message.chat, chat_data, target.id):
+            await self.safe_reply(message, "⛔️ Этого пользователя нельзя забанить")
             return
 
         try:
-            await context.bot.ban_chat_member(
-                update.effective_chat.id, target.id, revoke_messages=True
+            await message.bot.ban_chat_member(
+                message.chat.id, target.id, revoke_messages=True
             )
             self.banned_users.add(target.id)
-            context.bot_data["banned_users"] = list(self.banned_users)
-            await self.safe_reply(
-                update, context, f"✅️ {get_mention(target)} был забанен"
-            )
+            bot_data["banned_users"] = list(self.banned_users)
+            await self.safe_reply(message, f"✅️ {get_mention(target)} был забанен")
         except Exception as e:
-            await self.safe_reply(update, context, f"⚠️ Ошибка бана: {e}")
+            await self.safe_reply(message, f"⚠️ Ошибка бана: {e}")
 
     async def handle_unban(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
-        target = await resolve_user(update, context, params)
+        target = await resolve_user(message, bot_data, message.chat, params)
         if not target:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "⚠️ Кого разбанить? Ответь на сообщение или укажи @username",
             )
             return
 
         try:
-            await context.bot.unban_chat_member(
-                update.effective_chat.id, target.id, only_if_banned=True
+            await message.bot.unban_chat_member(
+                message.chat.id, target.id, only_if_banned=True
             )
             self.banned_users.discard(target.id)
-            context.bot_data["banned_users"] = list(self.banned_users)
+            bot_data["banned_users"] = list(self.banned_users)
             await self.safe_reply(
-                update, context, f"✅️ {get_mention(target)} возвращён из гулага"
+                message, f"✅️ {get_mention(target)} возвращён из гулага"
             )
         except Exception as e:
-            await self.safe_reply(update, context, f"⚠️ Ошибка разбана: {e}")
+            await self.safe_reply(message, f"⚠️ Ошибка разбана: {e}")
 
     async def handle_block(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
         if not params:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "Использование: пибот заблокируй <id> или @username",
             )
             return
 
-        target = await resolve_user(update, context, params)
+        target = await resolve_user(message, bot_data, message.chat, params)
         if target:
             target_id = target.id
         else:
             try:
                 target_id = int(params.strip())
             except ValueError:
-                await self.safe_reply(
-                    update, context, "⚠️ Укажи числовой ID или @username"
-                )
+                await self.safe_reply(message, "⚠️ Укажи числовой ID или @username")
                 return
 
         self.banned_users.add(target_id)
-        context.bot_data["banned_users"] = list(self.banned_users)
-        await self.safe_reply(
-            update, context, f"✅️ Пользователь {target_id} заблокирован"
-        )
+        bot_data["banned_users"] = list(self.banned_users)
+        await self.safe_reply(message, f"✅️ Пользователь {target_id} заблокирован")
+
+    async def handle_unblock(
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
+    ) -> None:
+        if not params:
+            await self.safe_reply(
+                message,
+                "Использование: пибот разблокируй <id> или @username",
+            )
+            return
+
+        target = await resolve_user(message, bot_data, message.chat, params)
+        if target:
+            target_id = target.id
+        else:
+            try:
+                target_id = int(params.strip())
+            except ValueError:
+                await self.safe_reply(message, "⚠️ Укажи числовой ID или @username")
+                return
+
+        if target_id not in self.banned_users:
+            await self.safe_reply(message, f"⚠️ Пользователь {target_id} не в чёрном списке")
+            return
+
+        self.banned_users.discard(target_id)
+        bot_data["banned_users"] = list(self.banned_users)
+        await self.safe_reply(message, f"✅️ Пользователь {target_id} разблокирован")
 
     async def handle_mute(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
         duration_minutes = None
         user_params = params
@@ -704,7 +1038,7 @@ class PiBot:
                         duration_minutes = None
                 except ValueError:
                     pass
-            elif update.message.reply_to_message:
+            elif message.reply_to_message:
                 try:
                     duration_minutes = float(parts[0])
                     if duration_minutes >= 0.5:
@@ -712,76 +1046,80 @@ class PiBot:
                 except ValueError:
                     pass
 
-        target = await resolve_user(update, context, user_params)
+        target = await resolve_user(message, bot_data, message.chat, user_params)
         if not target:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "⚠️ Кого мутить? Ответь на сообщение или укажи @username",
             )
             return
 
-        if await target_immune_to_mkb(update, context, target.id):
-            await self.safe_reply(
-                update, context, "⛔️ Этого пользователя нельзя замутить"
-            )
+        if await target_immune_to_mkb(message.chat, chat_data, target.id):
+            await self.safe_reply(message, "⛔️ Этого пользователя нельзя замутить")
             return
 
         try:
             if duration_minutes is not None:
                 until_date = int(time.time()) + int(duration_minutes * 60)
-                await context.bot.restrict_chat_member(
-                    update.effective_chat.id,
+                await message.bot.restrict_chat_member(
+                    message.chat.id,
                     target.id,
                     permissions=NO_PERMISSIONS,
                     until_date=until_date,
                 )
                 end_str = datetime.fromtimestamp(until_date).strftime("%H:%M")
                 await self.safe_reply(
-                    update,
-                    context,
+                    message,
                     f"✅️ {get_mention(target)} рот прикрой на {duration_minutes} минут (до {end_str})",
                 )
             else:
-                await context.bot.restrict_chat_member(
-                    update.effective_chat.id, target.id, permissions=NO_PERMISSIONS
+                await message.bot.restrict_chat_member(
+                    message.chat.id,
+                    target.id,
+                    permissions=NO_PERMISSIONS,
                 )
                 await self.safe_reply(
-                    update, context, f"✅️ {get_mention(target)} не глаголь тут"
+                    message, f"✅️ {get_mention(target)} не глаголь тут"
                 )
         except Exception as e:
-            await self.safe_reply(update, context, f"⚠️ Ошибка мута: {e}")
+            await self.safe_reply(message, f"⚠️ Ошибка мута: {e}")
 
     async def handle_unmute(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
-        target = await resolve_user(update, context, params)
+        target = await resolve_user(message, bot_data, message.chat, params)
         if not target:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "⚠️ Кого размутить? Ответь на сообщение или укажи @username",
             )
             return
 
         try:
-            await context.bot.restrict_chat_member(
-                update.effective_chat.id, target.id, permissions=ALL_PERMISSIONS
+            await message.bot.restrict_chat_member(
+                message.chat.id,
+                target.id,
+                permissions=ALL_PERMISSIONS,
             )
-            await self.safe_reply(
-                update, context, f"✅️ {get_mention(target)} больше не буянь"
-            )
+            await self.safe_reply(message, f"✅️ {get_mention(target)} больше не буянь")
         except Exception as e:
-            await self.safe_reply(update, context, f"⚠️ Ошибка размута: {e}")
+            await self.safe_reply(message, f"⚠️ Ошибка размута: {e}")
 
     async def handle_rank(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
         parts = params.split(maxsplit=2)
         if len(parts) < 1:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "Использование: пибот ранг n для @user (n = 2, 3, 4)",
             )
             return
@@ -790,14 +1128,13 @@ class PiBot:
             new_rank = int(parts[0])
         except ValueError:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "Использование: пибот ранг n для @user (n = 2, 3, 4)",
             )
             return
 
         if new_rank not in (RANK_ADMIN_PLUS, RANK_ADMIN, RANK_MEMBER):
-            await self.safe_reply(update, context, "Ранг может быть только 2, 3 или 4")
+            await self.safe_reply(message, "Ранг может быть только 2, 3 или 4")
             return
 
         target_str = ""
@@ -806,48 +1143,46 @@ class PiBot:
         elif len(parts) == 2:
             target_str = parts[1]
 
-        target = await resolve_user(update, context, target_str)
+        target = await resolve_user(message, bot_data, message.chat, target_str)
         if not target:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "⚠️ Кому изменить ранг? Ответь на сообщение или укажи @username",
             )
             return
 
-        if target.id == context.bot.id:
-            await self.safe_reply(update, context, "⛔️ Нельзя изменить ранг бота")
+        bot_user = await self.bot.me()
+        if target.id == bot_user.id:
+            await self.safe_reply(message, "⛔️ Нельзя изменить ранг бота")
             return
 
-        target_rank = await get_user_rank(update, context, target.id)
+        target_rank = await get_user_rank(message.chat, chat_data, target.id)
         if target_rank == RANK_OWNER:
-            await self.safe_reply(update, context, "⛔️ Нельзя изменить ранг владельца")
+            await self.safe_reply(message, "⛔️ Нельзя изменить ранг владельца")
             return
 
         try:
-            target_member = await update.effective_chat.get_member(target.id)
+            target_member = await message.chat.get_member(target.id)
             is_tg_admin = target_member.status == ChatMemberStatus.ADMINISTRATOR
         except Exception:
             is_tg_admin = False
 
         if is_tg_admin and new_rank == RANK_MEMBER:
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "⛔️ Нельзя выдать ранг 4 администратору. Понизьте его через Telegram.",
             )
             return
 
         if not is_tg_admin and new_rank in (RANK_ADMIN_PLUS, RANK_ADMIN):
             await self.safe_reply(
-                update,
-                context,
+                message,
                 "⛔️ Нельзя выдать ранг 2 или 3 обычному участнику. "
                 "Сначала выдайте админку через Telegram.",
             )
             return
 
-        ranks = context.chat_data.setdefault("ranks", {})
+        ranks = chat_data.setdefault("ranks", {})
         ranks[target.id] = new_rank
 
         rank_names = {
@@ -856,39 +1191,66 @@ class PiBot:
             RANK_MEMBER: "Member",
         }
         await self.safe_reply(
-            update,
-            context,
+            message,
             f"✅️ Ранг {get_mention(target)} изменён на {rank_names[new_rank]}",
         )
 
     async def handle_botinfo_cmd(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
         text = await self._read_text_file_async(BOTINFO_PATH)
         if not text:
             text = "⚠️ Инфа потерялась, проверь путь к моему описанию"
-        await self.safe_reply(update, context, text)
+        await self.safe_reply(message, text)
 
     async def handle_changelog_cmd(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
         text = await self._read_text_file_async(CHANGELOG_PATH)
         if not text:
             text = "⚠️ Инфа потерялась, проверь путь к моим обновам"
-        await self.safe_reply(update, context, text)
+        await self.safe_reply(message, text)
 
     async def handle_commands_cmd(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
         text = await self._read_text_file_async(COMMANDLIST_PATH)
         if not text:
             text = "⚠️ Инфа потерялась, проверь путь к списку команд"
-        await self.safe_reply(update, context, text)
+        await self.safe_reply(message, text)
+
+    # async def handle_devcommands_cmd(
+    #     self,
+    #     message: Message,
+    #     chat_data: dict,
+    #     bot_data: dict,
+    #     params: str,
+    # ) -> None:
+    #     text = await self._read_text_file_async(DEVCOMMANDS_PATH)
+    #     if not text:
+    #         text = "⚠️ Инфа потерялась, проверь путь к списку дев команд"
+    #     await self.safe_reply(message, text)
 
     async def handle_rank_list(
-        self, update: Update, context: CallbackContext, params: str
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
-        ranks = context.chat_data.setdefault("ranks", {})
+        ranks = chat_data.setdefault("ranks", {})
         rank_names = {RANK_ADMIN_PLUS: "Admin+", RANK_ADMIN: "Admin"}
         lines = []
 
@@ -896,250 +1258,207 @@ class PiBot:
             if rank not in (RANK_ADMIN_PLUS, RANK_ADMIN):
                 continue
             try:
-                member = await update.effective_chat.get_member(user_id)
+                member = await message.chat.get_member(user_id)
                 display = get_mention(member.user)
             except Exception:
                 display = str(user_id)
             lines.append(f"{display} имеет ранг {rank} — {rank_names[rank]}")
 
         if not lines:
-            await self.safe_reply(
-                update, context, "Нет пользователей с особыми рангами"
-            )
+            await self.safe_reply(message, "Нет пользователей с особыми рангами")
             return
 
-        await self.safe_reply(update, context, "\n".join(lines))
+        await self.safe_reply(message, "\n".join(lines))
 
-    async def handle_message(self, update: Update, context: CallbackContext) -> None:
-        if not self._pre_check(update, context):
-            return
-        text = update.message.text.strip()
-        if await self._handle_command(update, context, text):
-            return
-        if is_user_ignored(context, update.message.from_user.id):
-            return
-        lower_text = text.lower().translate(STRIP_PUNCT)
-        if await self._handle_rp(update, context, lower_text):
-            return
-        if await self._handle_phrase(update, context, lower_text):
-            return
-        if await self._handle_chance(update, context, lower_text):
-            return
-        await self._handle_llm(update, context, text)
+    async def handle_clear_db(
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
+    ) -> None:
+        try:
+            await self.persistence.clear_all()
 
-    def _pre_check(self, update: Update, context: CallbackContext) -> bool:
-        if not update.message or not update.message.text:
-            return False
-        if (
-            update.message.from_user
-            and update.message.from_user.id in self.banned_users
-        ):
-            return False
-        if update.message.date:
-            msg_date = update.message.date
-            if msg_date.tzinfo is None:
-                msg_date = msg_date.replace(tzinfo=timezone.utc)
-            msg_age = (datetime.now(timezone.utc) - msg_date).total_seconds()
-            if msg_age > MAX_MESSAGE_AGE:
-                if not update.message.text.lower().startswith(PIBOT_PREFIX):
-                    return False
-        return True
+            bot_data.clear()
+            bot_data["known_chats"] = set()
+            bot_data["username_map"] = {}
 
-    async def _handle_command(
-        self, update: Update, context: CallbackContext, text: str
-    ) -> bool:
-        lower = text.lower()
-        if not lower.startswith(PIBOT_PREFIX):
-            return False
-        rest = text[PIBOT_PREFIX_LEN:].strip()
-        if not rest:
-            return False
+            self.msg_locks.clear()
 
-        parts = rest.split(maxsplit=1)
-        subcommand = parts[0].lower()
-        params = parts[1] if len(parts) > 1 else ""
+            await self.safe_reply(message, "✅ База данных очищена")
+        except Exception as e:
+            logger.error("[clear_db] %s", e, exc_info=True)
+            await self.safe_reply(message, f"⚠️ Ошибка очистки базы данных: {e}")
 
-        if subcommand not in self.commands:
-            return False
-
-        cmd = self.commands[subcommand]
-        user_id = update.message.from_user.id
-
-        if cmd.dev_only:
-            if user_id not in self.dev_ids:
-                await self.safe_reply(
-                    update, context, "⛔️ Недостаточно прав для этой команды"
-                )
-                return True
-        else:
-            user_rank = await get_user_rank(update, context, user_id)
-            if user_rank > cmd.value:
-                await self.safe_reply(
-                    update, context, "⛔️ Недостаточно прав для этой команды"
-                )
-                return True
-
-        await cmd.handler(update, context, params)
-        return True
-
-    async def _handle_rp(
-        self, update: Update, context: CallbackContext, lower_text: str
-    ) -> bool:
-        if not (
-            update.message.reply_to_message
-            and update.message.reply_to_message.from_user
-        ):
-            return False
-        if lower_text not in self.rp_commands:
-            return False
-
-        if track_trigger_spam(context, update.message.from_user.id, lower_text):
-            await self.safe_reply(update, context, "Ой всё", disable_notification=True)
-            return True
-        if not await self.rate_limiter.acquire():
-            return True
-
-        user1 = get_mention(update.message.from_user)
-        user2 = get_mention(update.message.reply_to_message.from_user)
-        response = (
-            self.rp_commands[lower_text]
-            .replace("{mention1}", user1)
-            .replace("{mention2}", user2)
-        )
-        await self.safe_reply(update, context, response, disable_notification=True)
-        return True
-
-    async def _handle_phrase(
-        self, update: Update, context: CallbackContext, lower_text: str
-    ) -> bool:
-        if lower_text not in self.phrases:
-            return False
-
-        if track_trigger_spam(context, update.message.from_user.id, lower_text):
-            await self.safe_reply(update, context, "Ой всё", disable_notification=True)
-            return True
-        if not await self.rate_limiter.acquire():
-            return True
-
-        response = self.phrases[lower_text]
-        mention = get_mention(update.message.from_user)
-
-        if response in SPECIAL_RESPONSES:
-            path, fallback = SPECIAL_RESPONSES[response]
-            response = await self._read_text_file_async(path) or fallback
-
-        response = response.replace("{mention}", mention)
-        await self.safe_reply(update, context, response, disable_notification=True)
-        return True
-
-    async def _handle_chance(
-        self, update: Update, context: CallbackContext, lower_text: str
-    ) -> bool:
-        if not lower_text.startswith(CHANCE_TRIGGER):
-            return False
-
-        if track_trigger_spam(context, update.message.from_user.id, lower_text):
-            await self.safe_reply(update, context, "Ой всё", disable_notification=True)
-            return True
-        if not await self.rate_limiter.acquire():
-            return True
-
+    async def handle_chance_cmd(
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
+    ) -> None:
         n = random.randint(0, 100)
         await self.safe_reply(
-            update,
-            context,
+            message,
             f"Я думаю, что вероятность {n}%",
             disable_notification=True,
         )
-        return True
 
-    async def _handle_llm(
-        self, update: Update, context: CallbackContext, text: str
+    async def handle_all_chats(
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
     ) -> None:
-        if not self.llm_client:
-            return
-        if update.message.from_user.id == context.bot.id:
-            return
-
-        is_mentioned = False
-        if update.effective_chat.type == "private":
-            is_mentioned = True
-        elif update.message.entities:
-            bot_username = context.bot.username
-            for entity in update.message.entities:
-                if entity.type == MessageEntity.MENTION:
-                    mention = text[entity.offset : entity.offset + entity.length]
-                    if mention.lower() == f"@{bot_username.lower()}":
-                        is_mentioned = True
-                        break
-
-        if not is_mentioned:
+        known = bot_data.get("known_chats", set())
+        if not known:
+            await self.safe_reply(message, "Нет известных чатов")
             return
 
-        if not await self._get_llm_rate_limiter(update.effective_chat.id).acquire():
-            return
+        lines: list[str] = []
+        for cid in sorted(known)[:50]:
+            try:
+                chat = await message.bot.get_chat(cid)
+                title = chat.title or chat.username or chat.first_name or str(cid)
+                chat_type = {
+                    "private": "💬",
+                    "group": "👥",
+                    "supergroup": "📢",
+                    "channel": "📣",
+                }.get(chat.type, "❓")
+                lines.append(f"{chat_type} {title} (id: {cid})")
+            except Exception as e:
+                lines.append(f"❌ {cid} — {e}")
 
-        chat_history = context.chat_data.setdefault("llm_history", [])
-        history = list(chat_history)
-        if update.effective_chat.type in ("group", "supergroup"):
-            chat_context = context.chat_data.get("chat_context", [])
-            if chat_context:
-                history.append({"role": "system", "content": "Recent chat:\n" + "\n".join(chat_context)})
-        clean_text = text
-        if update.message.entities:
-            for entity in sorted(
-                update.message.entities, key=lambda e: e.offset, reverse=True
-            ):
-                if entity.type == MessageEntity.MENTION:
-                    clean_text = (
-                        clean_text[: entity.offset]
-                        + clean_text[entity.offset + entity.length :]
+        reply = "\n".join(lines)
+        if len(known) > 50:
+            reply += f"\n\n... и ещё {len(known) - 50} чатов"
+        await self.safe_reply(message, f"📋 Все чаты ({len(known)}):\n\n{reply}")
+
+    async def handle_ai_cmd(
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
+    ) -> None:
+        current = bot_data.get("llm_provider", "")
+        buttons = []
+        for p in self.providers.values():
+            if p.enabled:
+                label = f"{'✅ ' if p.name == current else ''}{p.display_name}"
+                buttons.append([
+                    InlineKeyboardButton(
+                        text=label,
+                        callback_data=f"aichange:{message.from_user.id}:{p.name}",
                     )
-        clean_text = clean_text.strip()
-        if not clean_text:
+                ])
+
+        if not buttons:
+            await self.safe_reply(message, "⚠️ Нет доступных AI провайдеров")
             return
 
-        history.append({"role": "user", "content": clean_text})
-        response_text = await self.ask_llm(history[-LLM_HISTORY_LIMIT:])
-        if response_text and response_text.startswith("__API_ERR"):
-            parts = response_text.split(":", 1)
-            msg = "API не доступен"
-            if len(parts) > 1 and parts[1]:
-                msg += f" ({parts[1]})"
-            await self.safe_reply(update, context, msg, disable_notification=True)
-        elif response_text:
-            history.append({"role": "assistant", "content": response_text})
-            context.chat_data["llm_history"] = history[-LLM_HISTORY_LIMIT:]
-            await self.safe_reply(
-                update, context, response_text, disable_notification=True
-            )
+        current_name = self.providers[current].display_name if current in self.providers else "—"
+        await self.safe_reply(
+            message,
+            f"🎛 Текущий AI бэкенд: {current_name}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
 
-    async def _cleanup_caches(self, context: CallbackContext) -> None:
-        known = context.bot_data.get("known_chats", set())
+    async def _handle_ai_change(self, callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        if len(parts) != 3:
+            return
+        _, user_id_str, provider_name = parts
+        try:
+            caller_id = int(user_id_str)
+        except ValueError:
+            return
+        if callback.from_user.id != caller_id:
+            await callback.answer("⛔️ Это не твоя кнопка", show_alert=True)
+            return
+        if provider_name not in self.providers or not self.providers[provider_name].enabled:
+            await callback.answer("⚠️ Провайдер недоступен", show_alert=True)
+            return
+
+        self.persistence.bot_data["llm_provider"] = provider_name
+        await self.persistence.flush()
+
+        await callback.message.edit_text(
+            f"✅ AI бэкенд переключён на {self.providers[provider_name].display_name}"
+        )
+        await callback.answer()
+
+    async def _cleanup_caches(self) -> None:
+        known = self.persistence.bot_data.get("known_chats", set())
+        now = time.time()
+
         for cid in list(self.msg_locks):
             if cid not in known:
                 del self.msg_locks[cid]
-        for cid in list(self.llm_rate_limiters):
-            if cid not in known:
-                del self.llm_rate_limiters[cid]
+
+        for chat_id, chat_data in list(self.persistence.chat_data.items()):
+            if chat_id not in known:
+                self.persistence.chat_data[chat_id] = {}
+                continue
+
+            trigger_spam = chat_data.get("trigger_spam")
+            if trigger_spam:
+                cutoff = now - TRIGGER_SPAM_WINDOW
+                for uid, phrases in list(trigger_spam.items()):
+                    for phrase, ts in list(phrases.items()):
+                        ts[:] = [t for t in ts if t > cutoff]
+                        if not ts:
+                            del phrases[phrase]
+                    if not phrases:
+                        del trigger_spam[uid]
+                if not trigger_spam:
+                    del chat_data["trigger_spam"]
+
+            spam_tracker = chat_data.get("spam_tracker")
+            if spam_tracker:
+                cutoff = now - ANTISPAM_WINDOW
+                for uid, ts in list(spam_tracker.items()):
+                    ts[:] = [t for t in ts if t > cutoff]
+                    if not ts:
+                        del spam_tracker[uid]
+                if not spam_tracker:
+                    del chat_data["spam_tracker"]
+
+            spam_warned = chat_data.get("spam_warned")
+            if spam_warned:
+                for uid, warned_at in list(spam_warned.items()):
+                    if now - warned_at > ANTISPAM_MUTE_DURATION:
+                        del spam_warned[uid]
+                if not spam_warned:
+                    del chat_data["spam_warned"]
+
+            ignored = chat_data.get("ignored_until")
+            if ignored:
+                for uid, expiry in list(ignored.items()):
+                    if now >= expiry:
+                        del ignored[uid]
+                if not ignored:
+                    del chat_data["ignored_until"]
+
+        await self.persistence.flush()
 
 
 def load_config() -> dict[str, str]:
     token = os.getenv("TELEGRAM_TOKEN", "")
-    groq_key = os.getenv("GROQ_KEY", "")
 
     if not token or token == "YOUR-TELEGRAM-TOKEN":
         raise ValueError(
             "❌ Токен не настроен!\n"
             "Вставьте токен в .env (TELEGRAM_TOKEN) (получить у @BotFather)"
         )
-    if not groq_key or groq_key == "YOUR-GROQ-API-KEY-HERE":
-        raise ValueError(
-            "❌ Groq API ключ не настроен!\n"
-            "Вставьте ключ в .env (GROQ_KEY) (получить на console.groq.com)"
-        )
 
-    return {"token": token, "groq_key": groq_key}
+    groq_key = os.getenv("GROQ_KEY", "")
+    openrouter_key = os.getenv("OPENROUTER_KEY", "")
+
+    return {"token": token, "groq_key": groq_key, "openrouter_key": openrouter_key}
 
 
 def main() -> None:
@@ -1148,18 +1467,17 @@ def main() -> None:
     try:
         cfg = load_config()
     except ValueError as e:
-        logging.basicConfig(level=logging.INFO)
+        setup_logging(logging.INFO)
         logger.error(e)
         return
 
     token = cfg["token"]
+    groq_key = cfg["groq_key"]
+    openrouter_key = cfg["openrouter_key"]
 
-    sys.path.insert(0, str(BASE / "important"))
-    from logging_settings import setup_logging  # type: ignore[import-untyped]
+    setup_logging(logging.INFO)
 
-    setup_logging(logging.INFO, token=token)
-
-    bot = PiBot(token)
+    bot = PiBot(token, groq_key, openrouter_key)
     logger.info("PiBot started...")
     bot.run()
 

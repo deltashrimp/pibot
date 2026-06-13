@@ -17,9 +17,9 @@ Telegram group moderation and interactive response bot. Supports English and Rus
 ---
 
 ## READMEs
-🇷🇺 [README на русском](./README-RU.md)
+🇷🇺 [README на русском](./info/README-RU.md)
 
-🇬🇧 [README in English](./README-EN.md)
+🇬🇧 [README in English](./info/README-EN.md)
 
 ---
 ## Changelogs
