@@ -347,6 +347,14 @@ class PiBotMiddleware(BaseMiddleware):
         if user_rank <= RANK_ADMIN:
             return await handler(event, data)
 
+        if event.date:
+            msg_date = event.date
+            if msg_date.tzinfo is None:
+                msg_date = msg_date.replace(tzinfo=timezone.utc)
+            msg_age = (datetime.now(timezone.utc) - msg_date).total_seconds()
+            if msg_age > MAX_MESSAGE_AGE:
+                return await handler(event, data)
+
         now = time.time()
         spam = chat_data.setdefault("spam_tracker", {})
         ts = spam.setdefault(user.id, [])
