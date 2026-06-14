@@ -64,18 +64,14 @@ def setup_logging(
 
     logger.addHandler(console_handler)
 
+    logger.setLevel(logging.DEBUG)
+
     if file_path is not None:
         file_handler = logging.FileHandler(file_path, encoding="utf-8")
         file_handler.setLevel(file_log_level)
         file_handler.setFormatter(file_formatter)
 
         logger.addHandler(file_handler)
-
-        # выбирает наименьший из уровней чтобы исключить то, что хендлерами не обрабатывается
-        logger.setLevel(min(console_log_level, file_log_level))
-
-    else:
-        logger.setLevel(console_log_level)
 
 
 # фикс логов бекенда, чтобы ошибки 4хх 5хх возвращали не INFO, а WARNING и ERROR

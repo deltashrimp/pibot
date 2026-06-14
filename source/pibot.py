@@ -1475,7 +1475,11 @@ def main() -> None:
     try:
         cfg = load_config()
     except ValueError as e:
-        setup_logging(logging.INFO)
+        setup_logging(
+            console_log_level=logging.DEBUG,
+            file_log_level=logging.WARNING,
+            file_path=BASE / "logs" / "logs.log",
+        )
         logger.error(e)
         return
 
@@ -1483,7 +1487,11 @@ def main() -> None:
     groq_key = cfg["groq_key"]
     openrouter_key = cfg["openrouter_key"]
 
-    setup_logging(logging.INFO)
+    setup_logging(
+        console_log_level=logging.DEBUG,
+        file_log_level=logging.WARNING,
+        file_path=BASE / "logs" / "logs.log",
+    )
 
     bot = PiBot(token, groq_key, openrouter_key)
     logger.info("PiBot started...")

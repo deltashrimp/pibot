@@ -13,9 +13,11 @@ echo -e "Копирование файлов конфигурации...\n"
 cp ./bot-data/public-phrases.json ./bot-data/phrases.json
 cp ./bot-data/public-botinfo.md ./bot-data/botinfo.md
 
+mkdir -pv logs && touch logs/logs.log
+
 echo -e "Создание файлов с ключами...\n"
 
-mkdir -p ./env/
+mkdir -pv ./env/
 echo "[]" > ./env/dev-ids.json
 
 cp .env.example .env
