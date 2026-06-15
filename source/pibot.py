@@ -29,6 +29,7 @@ from groq import AsyncGroq, RateLimitError
 from logging_settings import setup_logging
 from openai import AsyncOpenAI
 from persistence import SQLitePersistence
+from telemetry import Telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ RP_COMMANDS_PATH = BASE / "bot-data" / "rp-phrases.json"
 DEV_IDS_PATH = BASE / "env" / "dev-ids.json"
 PERSONALITY_PATH = BASE / "bot-data" / "personality.md"
 DEVCOMMANDS_PATH = BASE / "bot-data" / "dev-commands.md"
+TELEMETRY_PATH = BASE / "logs" / "telemetry.json"
 
 AI_MAX_HISTORY = 20
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -137,6 +139,15 @@ class RateLimiter:
             return False
 
 
+@dataclass
+class AIResponse:
+    content: str
+    model: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+
 class AIBackend:
     def __init__(
         self,
@@ -156,7 +167,7 @@ class AIBackend:
     def enabled(self) -> bool:
         return self.client is not None
 
-    async def generate(self, messages: list[dict]) -> str:
+    async def generate(self, messages: list[dict]) -> AIResponse:
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -164,7 +175,21 @@ class AIBackend:
                 temperature=0.7,
                 max_tokens=512,
             )
-            return response.choices[0].message.content or "⚠️ ИИ ничего не ответил"
+            if not response or not response.choices:
+                logger.error("[%s] Invalid API response: %s", self.name, response)
+                return AIResponse(
+                    content="⚠️ Ошибка при получении ответа от ИИ",
+                    model=self.model,
+                )
+            content = response.choices[0].message.content or "⚠️ ИИ ничего не ответил"
+            usage = response.usage
+            return AIResponse(
+                content=content,
+                model=response.model,
+                prompt_tokens=usage.prompt_tokens if usage else None,
+                completion_tokens=usage.completion_tokens if usage else None,
+                total_tokens=usage.total_tokens if usage else None,
+            )
         except Exception as e:
             if self._rate_limit_error and isinstance(e, self._rate_limit_error):
                 raise
@@ -416,7 +441,9 @@ class PiBot:
         self.banned_users: set[int] = set()
 
         self.msg_locks: dict[int, asyncio.Lock] = {}
+        self.bot_message_ids: dict[int, deque[int]] = {}
         self.rate_limiter = RateLimiter(max_calls=5, period=1.0)
+        self.telemetry = Telemetry(TELEMETRY_PATH)
 
         self.commands: dict[str, CommandConfig] = {}
         self._register_commands()
@@ -499,6 +526,8 @@ class PiBot:
             if p.enabled:
                 self.persistence.bot_data["llm_provider"] = p.name
                 break
+        else:
+            logger.warning("No enabled AI provider available")
 
     def _get_current_provider(self, bot_data: dict) -> AIBackend | None:
         name = bot_data.get("llm_provider", "")
@@ -508,6 +537,7 @@ class PiBot:
         for p in self.providers.values():
             if p.enabled:
                 return p
+        logger.warning("No enabled AI provider found")
         return None
 
     def _register_commands(self) -> None:
@@ -592,6 +622,11 @@ class PiBot:
             sent = await message.answer(
                 text, reply_to_message_id=message.message_id, **kwargs
             )
+            if sent and sent.chat.type in ("group", "supergroup"):
+                ids = self.bot_message_ids.setdefault(sent.chat.id, deque())
+                ids.append(sent.message_id)
+                while len(ids) > MAX_TRACKED_MESSAGES:
+                    ids.popleft()
             return sent
         except Exception as e:
             logger.warning("[safe_reply] Failed to send message: %s", e)
@@ -782,6 +817,7 @@ class PiBot:
     ) -> None:
         provider = self._get_current_provider(bot_data)
         if not provider or not provider.enabled:
+            logger.warning("No available AI provider for message handling")
             return
 
         if message.chat.type in ("group", "supergroup"):
@@ -805,19 +841,75 @@ class PiBot:
 
         ai_messages = self._build_ai_messages(message, query)
 
+        start = time.monotonic()
         try:
-            answer = await provider.generate(ai_messages)
+            ai_response = await provider.generate(ai_messages)
+            duration = round((time.monotonic() - start) * 1000)
+            answer = ai_response.content
+            if not answer:
+                logger.error("[%s] Empty response from AI", provider.name)
+                await self.safe_reply(message, "⚠️ ИИ не смог сгенерировать ответ")
+                await self.telemetry.record({
+                    "user_id": message.from_user.id,
+                    "username": message.from_user.username,
+                    "chat_id": message.chat.id,
+                    "chat_type": message.chat.type,
+                    "provider": provider.name,
+                    "model": provider.model,
+                    "success": False,
+                    "duration_ms": duration,
+                    "error": "Empty response",
+                })
+                return
         except RateLimitError:
+            duration = round((time.monotonic() - start) * 1000)
             logger.warning("[%s] 429 Rate Limit", provider.name)
+            await self.telemetry.record({
+                "user_id": message.from_user.id,
+                "username": message.from_user.username,
+                "chat_id": message.chat.id,
+                "chat_type": message.chat.type,
+                "provider": provider.name,
+                "model": provider.model,
+                "success": False,
+                "duration_ms": duration,
+                "error": "RateLimitError",
+            })
             await self.safe_reply(
                 message,
                 "⚠️ Ты достиг лимита апи, задрот",
             )
             return
         except Exception as e:
+            duration = round((time.monotonic() - start) * 1000)
             logger.error("[%s] API error: %s", provider.name, e, exc_info=True)
+            await self.telemetry.record({
+                "user_id": message.from_user.id,
+                "username": message.from_user.username,
+                "chat_id": message.chat.id,
+                "chat_type": message.chat.type,
+                "provider": provider.name,
+                "model": provider.model,
+                "success": False,
+                "duration_ms": duration,
+                "error": str(e),
+            })
             await self.safe_reply(message, "⚠️ Ошибка при обращении к ИИ")
             return
+
+        await self.telemetry.record({
+            "user_id": message.from_user.id,
+            "username": message.from_user.username,
+            "chat_id": message.chat.id,
+            "chat_type": message.chat.type,
+            "provider": provider.name,
+            "model": ai_response.model,
+            "success": True,
+            "duration_ms": duration,
+            "prompt_tokens": ai_response.prompt_tokens,
+            "completion_tokens": ai_response.completion_tokens,
+            "total_tokens": ai_response.total_tokens,
+        })
 
         if message.chat.type == "private":
             history = self.conversation_history.setdefault(message.chat.id, [])
@@ -853,14 +945,23 @@ class PiBot:
 
         chat_id = message.chat.id
         async with self._get_msg_lock(chat_id):
-            ids = chat_data.setdefault("message_ids", deque())
-            if not ids:
+            user_ids = chat_data.setdefault("message_ids", deque())
+            bot_ids = self.bot_message_ids.setdefault(chat_id, deque())
+
+            all_ids = set(user_ids) | set(bot_ids)
+            if not all_ids:
                 await self.safe_reply(message, "⚠️ Не найдено сообщений")
                 return
 
-            n = min(n, len(ids)) + 1
-            ids_to_delete = [ids.pop() for _ in range(n)]
-            ids_to_delete.reverse()
+            sorted_ids = sorted(all_ids)
+            count = min(n + 1, len(sorted_ids))
+            ids_to_delete = sorted_ids[-count:]
+
+            for mid in ids_to_delete:
+                if mid in user_ids:
+                    user_ids.remove(mid)
+                if mid in bot_ids:
+                    bot_ids.remove(mid)
 
         if not ids_to_delete:
             await self.safe_reply(message, "⚠️ Нет сообщений для удаления")
@@ -1406,6 +1507,10 @@ class PiBot:
         for cid in list(self.msg_locks):
             if cid not in known:
                 del self.msg_locks[cid]
+
+        for cid in list(self.bot_message_ids):
+            if cid not in known:
+                del self.bot_message_ids[cid]
 
         for chat_id, chat_data in list(self.persistence.chat_data.items()):
             if chat_id not in known:

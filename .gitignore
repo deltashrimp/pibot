@@ -19,6 +19,9 @@ bot_data.db
 logs/
 *.log
 
+# Telemetry data
+telemetry.json
+
 # Sensitive project files
 isthisalis-home-adress.md
 sex-with-ramses666.mp4

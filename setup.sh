@@ -31,6 +31,7 @@ echo -e "------------------------------------------------\n\n"
 sleep 3
 
 chmod +x ./launchbot.sh
+chmod +x ./cleanlogs.md
 
 echo -e "Установка зависимостей...\n"
 
