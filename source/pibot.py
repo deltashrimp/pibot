@@ -68,6 +68,7 @@ ANTISPAM_WINDOW = 1.0
 ANTISPAM_MSG_LIMIT = 5
 ANTISPAM_MUTE_THRESHOLD = 9
 ANTISPAM_MUTE_DURATION = 60
+ANTISPAM_MAX_MESSAGE_AGE = 180  # 3 minutes
 PIBOT_PREFIX = "пибот "
 PIBOT_PREFIX_LEN = len(PIBOT_PREFIX)
 
@@ -452,8 +453,11 @@ class PiBotMiddleware(BaseMiddleware):
             if msg_date.tzinfo is None:
                 msg_date = msg_date.replace(tzinfo=timezone.utc)
             msg_age = (datetime.now(timezone.utc) - msg_date).total_seconds()
-            if msg_age > MAX_MESSAGE_AGE:
+            if msg_age > ANTISPAM_MAX_MESSAGE_AGE:
                 return await handler(event, data)
+
+        if time.time() - self.pibot.start_time < 15:
+            return await handler(event, data)
 
         now = time.time()
         spam = chat_data.setdefault("spam_tracker", {})
@@ -549,6 +553,7 @@ class PiBot:
         )
 
         self._pid_fd: int | None = None
+        self.start_time: float = 0.0
         self.bot_id: int = 0
         self.bot_username: str = ""
 
@@ -658,6 +663,8 @@ class PiBot:
                     dev_id,
                     e,
                 )
+
+        self.start_time = time.time()
 
     async def _on_shutdown(self) -> None:
         await self.persistence.flush()
@@ -1517,7 +1524,7 @@ class PiBot:
             )
             return
 
-        status_msg = await self.safe_reply(message, "⏳ Клонирую репозиторий...")
+        status_msg = await self.safe_reply(message, "Ща, жди")
 
         tmp_dir = None
         zip_path = None
@@ -1525,7 +1532,10 @@ class PiBot:
             tmp_dir = tempfile.mkdtemp(prefix="pibot_clone_")
 
             proc = await asyncio.create_subprocess_exec(
-                "git", "clone", url, tmp_dir,
+                "git",
+                "clone",
+                url,
+                tmp_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -1533,14 +1543,16 @@ class PiBot:
 
             if proc.returncode != 0:
                 error_text = stderr.decode().strip() if stderr else "неизвестная ошибка"
-                await self.safe_reply(message, f"⚠️ Ошибка клонирования:\n{error_text[:500]}")
+                await self.safe_reply(
+                    message, f"⚠️ Ошибка клонирования:\n{error_text[:500]}"
+                )
                 return
 
             repo_name = url.rstrip("/").split("/")[-1].removesuffix(".git") or "repo"
             zip_path = f"/tmp/{repo_name}.zip"
 
             try:
-                await status_msg.edit_text("🗜️ Архивирую...")
+                await status_msg.edit_text("Ещё чуть-чуть жди")
             except Exception:
                 pass
 
@@ -1560,7 +1572,7 @@ class PiBot:
 
             await message.answer_document(
                 FSInputFile(zip_path),
-                caption=f"📦 {url}",
+                caption=f"{url}",
             )
 
             if status_msg:
