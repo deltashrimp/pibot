@@ -1,9 +1,14 @@
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import random
+import shutil
 import string
+import subprocess
+import sys
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -18,6 +23,7 @@ from aiogram.types import (
     CallbackQuery,
     Chat,
     ChatPermissions,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -45,8 +51,12 @@ DEVCOMMANDS_PATH = BASE / "bot-data" / "dev-commands.md"
 TELEMETRY_PATH = BASE / "logs" / "telemetry.json"
 
 AI_MAX_HISTORY = 20
+AI_RETRY_MAX_ATTEMPTS = 3
+AI_RETRY_BASE_DELAY = 1.0
 GROQ_MODEL = "llama-3.3-70b-versatile"
 OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+
+PID_FILE = BASE / "pibot.pid"
 
 MAX_TRACKED_MESSAGES = 1000
 DELETE_BATCH_SIZE = 100
@@ -65,6 +75,19 @@ RANK_OWNER = 1
 RANK_ADMIN_PLUS = 2
 RANK_ADMIN = 3
 RANK_MEMBER = 4
+
+
+def pluralize_minutes(n: int) -> str:
+    n = abs(n)
+    if 11 <= n % 100 <= 19:
+        return "минут"
+    last = n % 10
+    if last == 1:
+        return "минуту"
+    if 2 <= last <= 4:
+        return "минуты"
+    return "минут"
+
 
 NO_PERMISSIONS = ChatPermissions(
     can_send_messages=False,
@@ -105,20 +128,50 @@ SPECIAL_RESPONSES = {
         COMMANDLIST_PATH,
         "⚠️ Инфа потерялась, проверь путь к списку команд",
     ),
-    # "__devcommands__": (
-    #     DEVCOMMANDS_PATH,
-    #     "⚠️ Инфа потерялась, проверь путь к моим обновам",
-    # ),
+    "__devcommands__": (
+        DEVCOMMANDS_PATH,
+        "⚠️ Инфа потерялась, проверь путь к моим обновам",
+    ),
 }
 
 STRIP_PUNCT = str.maketrans("", "", string.punctuation)
+
+
+def acquire_pid_lock() -> int:
+    try:
+        fd = os.open(str(PID_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        logger.debug("PID lock acquired (pid=%d)", os.getpid())
+        return fd
+    except (IOError, OSError):
+        try:
+            existing = PID_FILE.read_text().strip()
+            logger.critical(
+                "Другой экземпляр бота уже запущен (PID %s, файл %s)",
+                existing,
+                PID_FILE,
+            )
+        except Exception:
+            logger.critical("Другой экземпляр бота уже запущен (%s)", PID_FILE)
+        sys.exit(1)
+
+
+def release_pid_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        PID_FILE.unlink(missing_ok=True)
+        logger.debug("PID lock released")
+    except Exception as e:
+        logger.warning("Ошибка при освобождении PID блокировки: %s", e)
 
 
 @dataclass
 class CommandConfig:
     handler: Callable
     value: int
-    dev_only: bool = False
 
 
 class RateLimiter:
@@ -168,33 +221,55 @@ class AIBackend:
         return self.client is not None
 
     async def generate(self, messages: list[dict]) -> AIResponse:
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=0.7,
-                max_tokens=512,
-            )
-            if not response or not response.choices:
-                logger.error("[%s] Invalid API response: %s", self.name, response)
-                return AIResponse(
-                    content="⚠️ Ошибка при получении ответа от ИИ",
+        last_error: Exception | None = None
+        for attempt in range(AI_RETRY_MAX_ATTEMPTS):
+            try:
+                response = await self.client.chat.completions.create(
                     model=self.model,
+                    messages=messages,  # type: ignore[arg-type]
+                    temperature=0.7,
+                    max_tokens=512,
                 )
-            content = response.choices[0].message.content or "⚠️ ИИ ничего не ответил"
-            usage = response.usage
-            return AIResponse(
-                content=content,
-                model=response.model,
-                prompt_tokens=usage.prompt_tokens if usage else None,
-                completion_tokens=usage.completion_tokens if usage else None,
-                total_tokens=usage.total_tokens if usage else None,
-            )
-        except Exception as e:
-            if self._rate_limit_error and isinstance(e, self._rate_limit_error):
-                raise
-            logger.error("[%s] API error: %s", self.name, e, exc_info=True)
-            raise
+                if not response or not response.choices:
+                    logger.error("[%s] Invalid API response: %s", self.name, response)
+                    return AIResponse(
+                        content="⚠️ Ошибка при получении ответа от ИИ",
+                        model=self.model,
+                    )
+                content = (
+                    response.choices[0].message.content or "⚠️ ИИ ничего не ответил"
+                )
+                usage = response.usage
+                return AIResponse(
+                    content=content,
+                    model=response.model,
+                    prompt_tokens=usage.prompt_tokens if usage else None,
+                    completion_tokens=usage.completion_tokens if usage else None,
+                    total_tokens=usage.total_tokens if usage else None,
+                )
+            except Exception as e:
+                if self._rate_limit_error and isinstance(e, self._rate_limit_error):
+                    raise
+                last_error = e
+                if attempt < AI_RETRY_MAX_ATTEMPTS - 1:
+                    delay = AI_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        "[%s] API error (attempt %d/%d): %s. Retrying in %.1fs...",
+                        self.name,
+                        attempt + 1,
+                        AI_RETRY_MAX_ATTEMPTS,
+                        e,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+        logger.error(
+            "[%s] API error after %d attempts: %s",
+            self.name,
+            AI_RETRY_MAX_ATTEMPTS,
+            last_error,
+            exc_info=True,
+        )
+        raise last_error  # type: ignore[misc]
 
 
 def load_phrases() -> dict[str, str]:
@@ -433,7 +508,9 @@ class PiBotMiddleware(BaseMiddleware):
 
 
 class PiBot:
-    def __init__(self, token: str, groq_key: str = "", openrouter_key: str = "") -> None:
+    def __init__(
+        self, token: str, groq_key: str = "", openrouter_key: str = ""
+    ) -> None:
         self.phrases = load_phrases()
         self.rp_commands = load_rp_commands()
         self.dev_ids = load_dev_ids()
@@ -471,6 +548,7 @@ class PiBot:
             self._handle_ai_change
         )
 
+        self._pid_fd: int | None = None
         self.bot_id: int = 0
         self.bot_username: str = ""
 
@@ -514,7 +592,9 @@ class PiBot:
 
         enabled = [p for p in self.providers.values() if p.enabled]
         logger.info(
-            "AI: инициализировано %d провайдеров" if enabled else "AI: ни один провайдер не настроен",
+            "AI: инициализировано %d провайдеров"
+            if enabled
+            else "AI: ни один провайдер не настроен",
             len(enabled),
         )
 
@@ -543,28 +623,23 @@ class PiBot:
     def _register_commands(self) -> None:
         self.commands["сотри"] = CommandConfig(self.handle_nuke, 2)
         self.commands["кикни"] = CommandConfig(self.handle_kick, 2)
-        self.commands["кинь в гулаг"] = CommandConfig(self.handle_ban, 1)
+        self.commands["ликвидируй"] = CommandConfig(self.handle_ban, 1)
         self.commands["верни"] = CommandConfig(self.handle_unban, 1)
-        self.commands["заблокируй"] = CommandConfig(self.handle_block, 0, dev_only=True)
-        self.commands["разблокируй"] = CommandConfig(self.handle_unblock, 0, dev_only=True)
+        self.commands["заблокируй"] = CommandConfig(self.handle_block, 0)
+        self.commands["разблокируй"] = CommandConfig(self.handle_unblock, 0)
         self.commands["мут"] = CommandConfig(self.handle_mute, 3)
         self.commands["размут"] = CommandConfig(self.handle_unmute, 3)
         self.commands["ранг"] = CommandConfig(self.handle_rank, 1)
         self.commands["био"] = CommandConfig(self.handle_botinfo_cmd, 4)
         self.commands["обновы"] = CommandConfig(self.handle_changelog_cmd, 4)
         self.commands["команды"] = CommandConfig(self.handle_commands_cmd, 4)
-        # self.commands["дев команды"] = CommandConfig(self.handle_devcommands_cmd, 4)
+        self.commands["дев команды"] = CommandConfig(self.handle_devcommands_cmd, 0)
         self.commands["ранги"] = CommandConfig(self.handle_rank_list, 4)
         self.commands["инфа"] = CommandConfig(self.handle_chance_cmd, 4)
-        self.commands["все чаты"] = CommandConfig(
-            self.handle_all_chats, 0, dev_only=True
-        )
-        self.commands["ии"] = CommandConfig(
-            self.handle_ai_cmd, 0, dev_only=True
-        )
-        self.commands["очистка бд"] = CommandConfig(
-            self.handle_clear_db, 0, dev_only=True
-        )
+        self.commands["все чаты"] = CommandConfig(self.handle_all_chats, 0)
+        self.commands["ии"] = CommandConfig(self.handle_ai_cmd, 0)
+        self.commands["очистка бд"] = CommandConfig(self.handle_clear_db, 0)
+        self.commands["клонируй"] = CommandConfig(self.handle_git_clone, 0)
 
     async def _on_startup(self) -> None:
         await self.persistence.load_all()
@@ -586,6 +661,9 @@ class PiBot:
 
     async def _on_shutdown(self) -> None:
         await self.persistence.flush()
+        if self._pid_fd is not None:
+            release_pid_lock(self._pid_fd)
+            self._pid_fd = None
 
     async def _periodic_cleanup(self) -> None:
         while True:
@@ -596,7 +674,13 @@ class PiBot:
                 logger.warning("[cleanup] %s", e)
 
     def run(self) -> None:
-        asyncio.run(self.dp.start_polling(self.bot))
+        asyncio.run(
+            self.dp.start_polling(
+                self.bot,
+                timeout=60,
+                allowed_updates=["message", "callback_query"],
+            )
+        )
 
     def _get_msg_lock(self, chat_id: int) -> asyncio.Lock:
         if chat_id not in self.msg_locks:
@@ -694,7 +778,7 @@ class PiBot:
         cmd = self.commands[subcommand]
         user_id = message.from_user.id
 
-        if cmd.dev_only:
+        if cmd.value == 0:
             if user_id not in self.dev_ids:
                 await self.safe_reply(message, "⛔️ Недостаточно прав для этой команды")
                 return True
@@ -842,74 +926,85 @@ class PiBot:
         ai_messages = self._build_ai_messages(message, query)
 
         start = time.monotonic()
-        try:
-            ai_response = await provider.generate(ai_messages)
-            duration = round((time.monotonic() - start) * 1000)
-            answer = ai_response.content
-            if not answer:
-                logger.error("[%s] Empty response from AI", provider.name)
-                await self.safe_reply(message, "⚠️ ИИ не смог сгенерировать ответ")
-                await self.telemetry.record({
-                    "user_id": message.from_user.id,
-                    "username": message.from_user.username,
-                    "chat_id": message.chat.id,
-                    "chat_type": message.chat.type,
-                    "provider": provider.name,
-                    "model": provider.model,
-                    "success": False,
-                    "duration_ms": duration,
-                    "error": "Empty response",
-                })
+        for attempt in range(AI_RETRY_MAX_ATTEMPTS):
+            try:
+                ai_response = await provider.generate(ai_messages)
+                break
+            except RateLimitError:
+                if attempt < AI_RETRY_MAX_ATTEMPTS - 1:
+                    delay = AI_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        "[%s] 429 Rate Limit (attempt %d/%d). Retrying in %.1fs...",
+                        provider.name,
+                        attempt + 1,
+                        AI_RETRY_MAX_ATTEMPTS,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                duration = round((time.monotonic() - start) * 1000)
+                logger.warning(
+                    "[%s] 429 Rate Limit after %d attempts",
+                    provider.name,
+                    AI_RETRY_MAX_ATTEMPTS,
+                )
+                await self.telemetry.record(
+                    {
+                        "user_id": message.from_user.id,
+                        "username": message.from_user.username,
+                        "chat_id": message.chat.id,
+                        "chat_type": message.chat.type,
+                        "provider": provider.name,
+                        "model": provider.model,
+                        "success": False,
+                        "duration_ms": duration,
+                        "error": "RateLimitError",
+                    }
+                )
+                await self.safe_reply(
+                    message,
+                    "⚠️ Ты достиг лимита апи, задрот",
+                )
                 return
-        except RateLimitError:
-            duration = round((time.monotonic() - start) * 1000)
-            logger.warning("[%s] 429 Rate Limit", provider.name)
-            await self.telemetry.record({
-                "user_id": message.from_user.id,
-                "username": message.from_user.username,
-                "chat_id": message.chat.id,
-                "chat_type": message.chat.type,
-                "provider": provider.name,
-                "model": provider.model,
-                "success": False,
-                "duration_ms": duration,
-                "error": "RateLimitError",
-            })
-            await self.safe_reply(
-                message,
-                "⚠️ Ты достиг лимита апи, задрот",
-            )
-            return
-        except Exception as e:
-            duration = round((time.monotonic() - start) * 1000)
-            logger.error("[%s] API error: %s", provider.name, e, exc_info=True)
-            await self.telemetry.record({
-                "user_id": message.from_user.id,
-                "username": message.from_user.username,
-                "chat_id": message.chat.id,
-                "chat_type": message.chat.type,
-                "provider": provider.name,
-                "model": provider.model,
-                "success": False,
-                "duration_ms": duration,
-                "error": str(e),
-            })
-            await self.safe_reply(message, "⚠️ Ошибка при обращении к ИИ")
+            except Exception as e:
+                duration = round((time.monotonic() - start) * 1000)
+                logger.error("[%s] API error: %s", provider.name, e, exc_info=True)
+                await self.telemetry.record(
+                    {
+                        "user_id": message.from_user.id,
+                        "username": message.from_user.username,
+                        "chat_id": message.chat.id,
+                        "chat_type": message.chat.type,
+                        "provider": provider.name,
+                        "model": provider.model,
+                        "success": False,
+                        "duration_ms": duration,
+                        "error": str(e),
+                    }
+                )
+                await self.safe_reply(message, "⚠️ Ошибка при обращении к ИИ")
+                return
+        else:
             return
 
-        await self.telemetry.record({
-            "user_id": message.from_user.id,
-            "username": message.from_user.username,
-            "chat_id": message.chat.id,
-            "chat_type": message.chat.type,
-            "provider": provider.name,
-            "model": ai_response.model,
-            "success": True,
-            "duration_ms": duration,
-            "prompt_tokens": ai_response.prompt_tokens,
-            "completion_tokens": ai_response.completion_tokens,
-            "total_tokens": ai_response.total_tokens,
-        })
+        duration = round((time.monotonic() - start) * 1000)
+        answer = ai_response.content
+
+        await self.telemetry.record(
+            {
+                "user_id": message.from_user.id,
+                "username": message.from_user.username,
+                "chat_id": message.chat.id,
+                "chat_type": message.chat.type,
+                "provider": provider.name,
+                "model": ai_response.model,
+                "success": True,
+                "duration_ms": duration,
+                "prompt_tokens": ai_response.prompt_tokens,
+                "completion_tokens": ai_response.completion_tokens,
+                "total_tokens": ai_response.total_tokens,
+            }
+        )
 
         if message.chat.type == "private":
             history = self.conversation_history.setdefault(message.chat.id, [])
@@ -995,12 +1090,12 @@ class PiBot:
         if not target:
             await self.safe_reply(
                 message,
-                "⚠️ Кого вышвырнуть? Ответь на сообщение или укажи @username",
+                "⚠️ Кого выкинуть? Ответь на сообщение или укажи @username",
             )
             return
 
         if await target_immune_to_mkb(message.chat, chat_data, target.id):
-            await self.safe_reply(message, "⛔️ Этого пользователя нельзя кикнуть")
+            await self.safe_reply(message, "⛔️ Этого пользователя нельзя выкинуть")
             return
 
         try:
@@ -1021,12 +1116,12 @@ class PiBot:
         if not target:
             await self.safe_reply(
                 message,
-                "⚠️ Кого банить? Ответь на сообщение или укажи @username",
+                "⚠️ Цель не найдена. Ответь на сообщение или укажи @username",
             )
             return
 
         if await target_immune_to_mkb(message.chat, chat_data, target.id):
-            await self.safe_reply(message, "⛔️ Этого пользователя нельзя забанить")
+            await self.safe_reply(message, "⛔️ Этого пользователя нельзя ликвидировать")
             return
 
         try:
@@ -1035,9 +1130,9 @@ class PiBot:
             )
             self.banned_users.add(target.id)
             bot_data["banned_users"] = list(self.banned_users)
-            await self.safe_reply(message, f"✅️ {get_mention(target)} был забанен")
+            await self.safe_reply(message, f"✅️ {get_mention(target)} был ликвидирован")
         except Exception as e:
-            await self.safe_reply(message, f"⚠️ Ошибка бана: {e}")
+            await self.safe_reply(message, f"⚠️ Ошибка ликвидации: {e}")
 
     async def handle_unban(
         self,
@@ -1050,7 +1145,7 @@ class PiBot:
         if not target:
             await self.safe_reply(
                 message,
-                "⚠️ Кого разбанить? Ответь на сообщение или укажи @username",
+                "⚠️ Кого воскресить? Ответь на сообщение или укажи @username",
             )
             return
 
@@ -1060,11 +1155,9 @@ class PiBot:
             )
             self.banned_users.discard(target.id)
             bot_data["banned_users"] = list(self.banned_users)
-            await self.safe_reply(
-                message, f"✅️ {get_mention(target)} возвращён из гулага"
-            )
+            await self.safe_reply(message, f"✅️ {get_mention(target)} воскрес")
         except Exception as e:
-            await self.safe_reply(message, f"⚠️ Ошибка разбана: {e}")
+            await self.safe_reply(message, f"⚠️ Ошибка воскрешения: {e}")
 
     async def handle_block(
         self,
@@ -1119,7 +1212,9 @@ class PiBot:
                 return
 
         if target_id not in self.banned_users:
-            await self.safe_reply(message, f"⚠️ Пользователь {target_id} не в чёрном списке")
+            await self.safe_reply(
+                message, f"⚠️ Пользователь {target_id} не в чёрном списке"
+            )
             return
 
         self.banned_users.discard(target_id)
@@ -1176,10 +1271,10 @@ class PiBot:
                     permissions=NO_PERMISSIONS,
                     until_date=until_date,
                 )
-                end_str = datetime.fromtimestamp(until_date).strftime("%H:%M")
+                # end_str = datetime.fromtimestamp(until_date).strftime("%H:%M")
                 await self.safe_reply(
                     message,
-                    f"✅️ {get_mention(target)} рот прикрой на {duration_minutes} минут (до {end_str})",
+                    f"✅️ {get_mention(target)} рот прикрой на {duration_minutes} {pluralize_minutes(int(duration_minutes))}",
                 )
             else:
                 await message.bot.restrict_chat_member(
@@ -1295,9 +1390,9 @@ class PiBot:
         ranks[target.id] = new_rank
 
         rank_names = {
-            RANK_ADMIN_PLUS: "Admin+",
-            RANK_ADMIN: "Admin",
-            RANK_MEMBER: "Member",
+            RANK_ADMIN_PLUS: "Админ+",
+            RANK_ADMIN: "Админ",
+            RANK_MEMBER: "Участник",
         }
         await self.safe_reply(
             message,
@@ -1340,17 +1435,17 @@ class PiBot:
             text = "⚠️ Инфа потерялась, проверь путь к списку команд"
         await self.safe_reply(message, text)
 
-    # async def handle_devcommands_cmd(
-    #     self,
-    #     message: Message,
-    #     chat_data: dict,
-    #     bot_data: dict,
-    #     params: str,
-    # ) -> None:
-    #     text = await self._read_text_file_async(DEVCOMMANDS_PATH)
-    #     if not text:
-    #         text = "⚠️ Инфа потерялась, проверь путь к списку дев команд"
-    #     await self.safe_reply(message, text)
+    async def handle_devcommands_cmd(
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
+    ) -> None:
+        text = await self._read_text_file_async(DEVCOMMANDS_PATH)
+        if not text:
+            text = "⚠️ Инфа потерялась, проверь путь к списку дев команд"
+        await self.safe_reply(message, text)
 
     async def handle_rank_list(
         self,
@@ -1399,6 +1494,89 @@ class PiBot:
         except Exception as e:
             logger.error("[clear_db] %s", e, exc_info=True)
             await self.safe_reply(message, f"⚠️ Ошибка очистки базы данных: {e}")
+
+    async def handle_git_clone(
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
+    ) -> None:
+        url = params.strip()
+        if not url:
+            await self.safe_reply(
+                message,
+                "Использование: пибот клонируй <url>",
+            )
+            return
+
+        if not url.startswith(("http://", "https://", "git@", "ssh://")):
+            await self.safe_reply(
+                message,
+                "⚠️ Некорректный URL. Укажи ссылку вида https://github.com/...",
+            )
+            return
+
+        status_msg = await self.safe_reply(message, "⏳ Клонирую репозиторий...")
+
+        tmp_dir = None
+        zip_path = None
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="pibot_clone_")
+
+            proc = await asyncio.create_subprocess_exec(
+                "git", "clone", url, tmp_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                error_text = stderr.decode().strip() if stderr else "неизвестная ошибка"
+                await self.safe_reply(message, f"⚠️ Ошибка клонирования:\n{error_text[:500]}")
+                return
+
+            repo_name = url.rstrip("/").split("/")[-1].removesuffix(".git") or "repo"
+            zip_path = f"/tmp/{repo_name}.zip"
+
+            try:
+                await status_msg.edit_text("🗜️ Архивирую...")
+            except Exception:
+                pass
+
+            shutil.make_archive(
+                zip_path.removesuffix(".zip"),
+                "zip",
+                tmp_dir,
+            )
+
+            size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+            if size_mb > 40:
+                await self.safe_reply(
+                    message,
+                    f"⚠️ Архив слишком большой ({size_mb:.1f} MB). Лимит 40 MB.",
+                )
+                return
+
+            await message.answer_document(
+                FSInputFile(zip_path),
+                caption=f"📦 {url}",
+            )
+
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.error("[git_clone] %s", e, exc_info=True)
+            await self.safe_reply(message, f"⚠️ Ошибка: {e}")
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            if zip_path and os.path.exists(zip_path):
+                os.remove(zip_path)
 
     async def handle_chance_cmd(
         self,
@@ -1458,18 +1636,22 @@ class PiBot:
         for p in self.providers.values():
             if p.enabled:
                 label = f"{'✅ ' if p.name == current else ''}{p.display_name}"
-                buttons.append([
-                    InlineKeyboardButton(
-                        text=label,
-                        callback_data=f"aichange:{message.from_user.id}:{p.name}",
-                    )
-                ])
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text=label,
+                            callback_data=f"aichange:{message.from_user.id}:{p.name}",
+                        )
+                    ]
+                )
 
         if not buttons:
             await self.safe_reply(message, "⚠️ Нет доступных AI провайдеров")
             return
 
-        current_name = self.providers[current].display_name if current in self.providers else "—"
+        current_name = (
+            self.providers[current].display_name if current in self.providers else "—"
+        )
         await self.safe_reply(
             message,
             f"🎛 Текущий AI бэкенд: {current_name}",
@@ -1488,7 +1670,10 @@ class PiBot:
         if callback.from_user.id != caller_id:
             await callback.answer("⛔️ Это не твоя кнопка", show_alert=True)
             return
-        if provider_name not in self.providers or not self.providers[provider_name].enabled:
+        if (
+            provider_name not in self.providers
+            or not self.providers[provider_name].enabled
+        ):
             await callback.answer("⚠️ Провайдер недоступен", show_alert=True)
             return
 
@@ -1599,6 +1784,7 @@ def main() -> None:
     )
 
     bot = PiBot(token, groq_key, openrouter_key)
+    bot._pid_fd = acquire_pid_lock()
     logger.info("PiBot started...")
     bot.run()
 

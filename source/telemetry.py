@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,10 +22,10 @@ class Telemetry:
 
     async def record(self, entry: dict[str, Any]) -> None:
         async with self._lock:
+            entry["timestamp"] = datetime.now().strftime("%d/%m/%Y, %H:%M")
             self._records.append(entry)
             self._write()
 
     def _write(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("w", encoding="utf-8") as f:
             json.dump(self._records, f, ensure_ascii=False, indent=2)

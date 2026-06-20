@@ -13,7 +13,7 @@ echo -e "Копирование файлов конфигурации...\n"
 cp ./bot-data/public-phrases.json ./bot-data/phrases.json
 cp ./bot-data/public-botinfo.md ./bot-data/botinfo.md
 
-mkdir -pv logs && touch logs/logs.log
+mkdir -pv logs && touch logs/logs.log logs/telemetry.json
 
 echo -e "Создание файлов с ключами...\n"
 

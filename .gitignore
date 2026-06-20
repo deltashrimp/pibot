@@ -15,6 +15,9 @@ source/bot_data.pickle
 source/bot_data.db
 bot_data.db
 
+# PID lock file (prevents multiple instances)
+pibot.pid
+
 # Log files
 logs/
 *.log
