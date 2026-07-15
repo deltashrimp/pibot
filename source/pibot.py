@@ -48,6 +48,7 @@ RP_COMMANDS_PATH = BASE / "bot-data" / "rp-phrases.json"
 DEV_IDS_PATH = BASE / "env" / "dev-ids.json"
 PERSONALITY_PATH = BASE / "bot-data" / "personality.md"
 DEVCOMMANDS_PATH = BASE / "bot-data" / "dev-commands.md"
+FILTERS_PATH = BASE / "bot-data" / "filters.json"
 TELEMETRY_PATH = BASE / "logs" / "telemetry.json"
 
 AI_MAX_HISTORY = 20
@@ -69,6 +70,7 @@ ANTISPAM_MSG_LIMIT = 5
 ANTISPAM_MUTE_THRESHOLD = 9
 ANTISPAM_MUTE_DURATION = 60
 ANTISPAM_MAX_MESSAGE_AGE = 180  # 3 minutes
+FILTER_MUTE_DURATION = 60
 PIBOT_PREFIX = "пибот "
 PIBOT_PREFIX_LEN = len(PIBOT_PREFIX)
 
@@ -287,6 +289,13 @@ def load_rp_commands() -> dict[str, str]:
     return {}
 
 
+def load_filters() -> list[str]:
+    if FILTERS_PATH.exists():
+        with open(FILTERS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
 def load_dev_ids() -> set[int]:
     if DEV_IDS_PATH.exists():
         with open(DEV_IDS_PATH, encoding="utf-8") as f:
@@ -448,6 +457,42 @@ class PiBotMiddleware(BaseMiddleware):
         if user_rank <= RANK_ADMIN:
             return await handler(event, data)
 
+        if event.text and self.pibot.filters:
+            skip_filter = False
+            if event.date:
+                f_date = event.date
+                if f_date.tzinfo is None:
+                    f_date = f_date.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - f_date).total_seconds() > MAX_MESSAGE_AGE:
+                    skip_filter = True
+            if not skip_filter:
+                text_lower = event.text.lower()
+                for pattern in self.pibot.filters:
+                    if pattern.lower() in text_lower:
+                        logger.info(
+                            "[Filter] удалено сообщение %d от %s (%s) в чате %d: совпадение с \"%s\"",
+                            event.message_id,
+                            user.id,
+                            user.username or user.first_name,
+                            chat_id,
+                            pattern,
+                        )
+                        try:
+                            await event.delete()
+                        except Exception as e:
+                            logger.warning("[Filter] не удалось удалить сообщение: %s", e)
+                        try:
+                            bot_instance: Bot = data["bot"]
+                            await bot_instance.restrict_chat_member(
+                                chat_id,
+                                user.id,
+                                permissions=NO_PERMISSIONS,
+                                until_date=int(time.time() + FILTER_MUTE_DURATION),
+                            )
+                        except Exception as e:
+                            logger.warning("[Filter] не удалось замутить: %s", e)
+                        return None
+
         if event.date:
             msg_date = event.date
             if msg_date.tzinfo is None:
@@ -518,6 +563,7 @@ class PiBot:
         self.phrases = load_phrases()
         self.rp_commands = load_rp_commands()
         self.dev_ids = load_dev_ids()
+        self.filters = load_filters()
 
         self.banned_users: set[int] = set()
 
@@ -551,6 +597,9 @@ class PiBot:
         self.dp.callback_query(lambda c: c.data and c.data.startswith("aichange:"))(
             self._handle_ai_change
         )
+        self.dp.callback_query(lambda c: c.data and c.data.startswith("writechat:"))(
+            self._handle_write_chat
+        )
 
         self._pid_fd: int | None = None
         self.start_time: float = 0.0
@@ -567,6 +616,7 @@ class PiBot:
             )
         self.conversation_history: dict[int, list[dict]] = {}
         self.chat_history: dict[int, list[dict]] = {}
+        self.pending_writes: dict[int, str] = {}
         self.ai_limiter = RateLimiter(max_calls=2, period=60.0)
         self._init_providers(groq_key, openrouter_key)
 
@@ -645,6 +695,7 @@ class PiBot:
         self.commands["ии"] = CommandConfig(self.handle_ai_cmd, 0)
         self.commands["очистка бд"] = CommandConfig(self.handle_clear_db, 0)
         self.commands["клонируй"] = CommandConfig(self.handle_git_clone, 0)
+        self.commands["напиши"] = CommandConfig(self.handle_write_cmd, 0)
 
     async def _on_startup(self) -> None:
         await self.persistence.load_all()
@@ -1696,6 +1747,76 @@ class PiBot:
             f"✅ AI бэкенд переключён на {self.providers[provider_name].display_name}"
         )
         await callback.answer()
+
+    async def handle_write_cmd(
+        self,
+        message: Message,
+        chat_data: dict,
+        bot_data: dict,
+        params: str,
+    ) -> None:
+        if not params:
+            await self.safe_reply(
+                message, "Использование: пибот напиши <текст>"
+            )
+            return
+
+        known = bot_data.get("known_chats", set())
+        if not known:
+            await self.safe_reply(message, "Нет известных чатов")
+            return
+
+        self.pending_writes[message.from_user.id] = params
+
+        buttons: list[list[InlineKeyboardButton]] = []
+        for cid in sorted(known)[:50]:
+            try:
+                chat = await message.bot.get_chat(cid)
+                title = chat.title or chat.username or chat.first_name or str(cid)
+            except Exception:
+                title = str(cid)
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=title,
+                        callback_data=f"writechat:{message.from_user.id}:{cid}",
+                    )
+                ]
+            )
+
+        await self.safe_reply(
+            message,
+            "📨 В какой чат отправить?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    async def _handle_write_chat(self, callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        if len(parts) != 3:
+            return
+        _, user_id_str, chat_id_str = parts
+        try:
+            caller_id = int(user_id_str)
+            target_chat_id = int(chat_id_str)
+        except ValueError:
+            return
+        if callback.from_user.id != caller_id:
+            await callback.answer("⛔️ Это не твоя кнопка", show_alert=True)
+            return
+
+        text = self.pending_writes.pop(caller_id, None)
+        if text is None:
+            await callback.answer("⚠️ Текст устарел, попробуй снова", show_alert=True)
+            return
+
+        try:
+            await callback.bot.send_message(target_chat_id, text)
+            await callback.message.edit_text(
+                f"✅ Отправлено в чат {target_chat_id}"
+            )
+            await callback.answer()
+        except Exception as e:
+            await callback.answer(f"❌ Не удалось отправить: {e}", show_alert=True)
 
     async def _cleanup_caches(self) -> None:
         known = self.persistence.bot_data.get("known_chats", set())
