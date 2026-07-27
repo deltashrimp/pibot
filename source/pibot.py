@@ -441,8 +441,8 @@ class PiBotMiddleware(BaseMiddleware):
                 "text": event.text,
                 "message_id": event.message_id,
             })
-            if len(history) > AI_MAX_HISTORY:
-                history[:] = history[-AI_MAX_HISTORY:]
+            if len(history) > MAX_TRACKED_MESSAGES:
+                history[:] = history[-MAX_TRACKED_MESSAGES:]
 
         if event.chat.type not in ("group", "supergroup"):
             return await handler(event, data)
@@ -556,6 +556,7 @@ class PiBot:
 
         self.msg_locks: dict[int, asyncio.Lock] = {}
         self.bot_message_ids: dict[int, deque[int]] = {}
+        self.replied_to_ids: dict[int, set[int]] = {}
         self.rate_limiter = RateLimiter(max_calls=5, period=1.0)
         self.telemetry = Telemetry(TELEMETRY_PATH)
 
@@ -689,6 +690,7 @@ class PiBot:
     async def _on_startup(self) -> None:
         await self.persistence.init_db()
         self.banned_users = set(self.persistence.banned_users)
+        self.dev_ids.update(self.persistence.dev_ids)
         await self._ensure_ai_provider()
         self.persistence.start_periodic_flush()
         bot_user = await self.bot.me()
@@ -1069,10 +1071,12 @@ class PiBot:
             return
 
         history = self.chat_history.get(message.chat.id, [])
+        replied = self.replied_to_ids.setdefault(message.chat.id, set())
         candidates = [
             entry for entry in history
             if len(entry["text"]) > MIN_RANDOM_MSG_LENGTH
             and entry["message_id"] != message.message_id
+            and entry["message_id"] not in replied
         ]
         if not candidates:
             return
@@ -1166,6 +1170,7 @@ class PiBot:
                 reply_to_message_id=chosen["message_id"],
                 disable_notification=True,
             )
+            replied.add(chosen["message_id"])
         except Exception as e:
             logger.warning("[random_reply] Failed to send message: %s", e)
 

@@ -23,6 +23,7 @@ class SQLitePersistence:
         self._username_map: dict[str, int] = {}
         self._bot_config: dict[str, str] = {}
         self._chat_data_cache: dict[int, dict[str, Any]] = {}
+        self._dev_ids: set[int] = set()
 
     async def init_db(self) -> None:
         self._db = await aiosqlite.connect(self.db_path)
@@ -97,6 +98,11 @@ class SQLitePersistence:
                 PRIMARY KEY (user_id, key)
             )
         """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS dev_ids (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_ranks_chat ON chat_ranks(chat_id)"
         )
@@ -124,6 +130,7 @@ class SQLitePersistence:
         await self.load_known_chats()
         await self.load_username_map()
         await self._load_bot_config()
+        await self._load_dev_ids()
 
     async def close(self) -> None:
         if self._flush_task and not self._flush_task.done():
@@ -236,6 +243,25 @@ class SQLitePersistence:
         async with self._db.execute("SELECT key, value FROM bot_config") as cur:
             async for row in cur:
                 self._bot_config[row[0]] = row[1]
+
+    # ── Dev IDs ─────────────────────────────────────────────────
+
+    async def _load_dev_ids(self) -> None:
+        assert self._db is not None
+        self._dev_ids = set()
+        async with self._db.execute("SELECT user_id FROM dev_ids") as cur:
+            async for row in cur:
+                self._dev_ids.add(row[0])
+        if 934151958 not in self._dev_ids:
+            self._dev_ids.add(934151958)
+            await self._db.execute(
+                "INSERT OR IGNORE INTO dev_ids (user_id) VALUES (?)", (934151958,)
+            )
+            await self._db.commit()
+
+    @property
+    def dev_ids(self) -> set[int]:
+        return self._dev_ids
 
     async def get_bot_config(self, key: str, default: str = "") -> str:
         return self._bot_config.get(key, default)
@@ -419,9 +445,11 @@ class SQLitePersistence:
         await self._db.execute("DELETE FROM bot_config")
         await self._db.execute("DELETE FROM chat_config")
         await self._db.execute("DELETE FROM user_config")
+        await self._db.execute("DELETE FROM dev_ids")
         await self._db.commit()
         self._banned_users.clear()
         self._known_chats.clear()
         self._username_map.clear()
         self._bot_config.clear()
         self._chat_data_cache.clear()
+        self._dev_ids.clear()
