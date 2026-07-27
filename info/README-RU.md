@@ -35,7 +35,7 @@ pibot/
 
 1. Скопировать репозиторий на сервер
 2. Запустить `bash setup.sh` — создаст файлы конфигов, venv и установит зависимости
-3. Вставить токен бота и Groq API ключ в `.env` (TELEGRAM_TOKEN, GROQ_KEY)
+3. Вставить токен бота и API ключи в `.env` (TELEGRAM_TOKEN, GROQ_KEY)
 4. Опционально настроить `bot-data/personality.md` и `bot-data/botinfo.md`
 5. Запустить `./launchbot.sh`
 

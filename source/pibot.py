@@ -35,20 +35,17 @@ from groq import AsyncGroq, RateLimitError
 from logging_settings import setup_logging
 from openai import AsyncOpenAI
 from persistence import SQLitePersistence
+from filtering import FilterManager, FILTERS
 from telemetry import Telemetry
 
 logger = logging.getLogger(__name__)
 
 BASE = Path(__file__).parent.parent
 PHRASES_PATH = BASE / "bot-data" / "phrases.json"
-BOTINFO_PATH = BASE / "bot-data" / "botinfo.md"
-CHANGELOG_PATH = BASE / "bot-data" / "changelog.md"
-COMMANDLIST_PATH = BASE / "info" / "command-list.md"
+LINKS_PATH = BASE / "bot-data" / "links.json"
 RP_COMMANDS_PATH = BASE / "bot-data" / "rp-phrases.json"
 DEV_IDS_PATH = BASE / "env" / "dev-ids.json"
 PERSONALITY_PATH = BASE / "bot-data" / "personality.md"
-DEVCOMMANDS_PATH = BASE / "bot-data" / "dev-commands.md"
-FILTERS_PATH = BASE / "bot-data" / "filters.json"
 TELEMETRY_PATH = BASE / "logs" / "telemetry.json"
 
 AI_MAX_HISTORY = 20
@@ -73,6 +70,8 @@ ANTISPAM_MAX_MESSAGE_AGE = 180  # 3 minutes
 FILTER_MUTE_DURATION = 60
 PIBOT_PREFIX = "пибот "
 PIBOT_PREFIX_LEN = len(PIBOT_PREFIX)
+RANDOM_REPLY_CHANCE = 0.30
+MIN_RANDOM_MSG_LENGTH = 30
 
 RANK_OWNER = 1
 RANK_ADMIN_PLUS = 2
@@ -123,19 +122,6 @@ ALL_PERMISSIONS = ChatPermissions(
     can_invite_users=True,
     can_pin_messages=True,
 )
-
-SPECIAL_RESPONSES = {
-    "__botinfo__": (BOTINFO_PATH, "⚠️ Инфа потерялась, проверь путь к моему описанию"),
-    "__changelog__": (CHANGELOG_PATH, "⚠️ Инфа потерялась, проверь путь к моим обновам"),
-    "__commandlist__": (
-        COMMANDLIST_PATH,
-        "⚠️ Инфа потерялась, проверь путь к списку команд",
-    ),
-    "__devcommands__": (
-        DEVCOMMANDS_PATH,
-        "⚠️ Инфа потерялась, проверь путь к моим обновам",
-    ),
-}
 
 STRIP_PUNCT = str.maketrans("", "", string.punctuation)
 
@@ -282,18 +268,18 @@ def load_phrases() -> dict[str, str]:
     return {}
 
 
+def load_links() -> dict[str, str]:
+    if LINKS_PATH.exists():
+        with open(LINKS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
 def load_rp_commands() -> dict[str, str]:
     if RP_COMMANDS_PATH.exists():
         with open(RP_COMMANDS_PATH, encoding="utf-8") as f:
             return json.load(f)
     return {}
-
-
-def load_filters() -> list[str]:
-    if FILTERS_PATH.exists():
-        with open(FILTERS_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    return []
 
 
 def load_dev_ids() -> set[int]:
@@ -318,7 +304,7 @@ def is_user_ignored(chat_data: dict, user_id: int) -> bool:
     return True
 
 
-def track_trigger_spam(chat_data: dict, user_id: int, phrase: str) -> bool:
+def track_trigger_spam(chat_data: dict, user_id: int, phrase: str, persistence: Any = None, chat_id: int = 0) -> bool:
     now = time.time()
     trackers = chat_data.setdefault("trigger_spam", {})
     user_tracker = trackers.setdefault(user_id, {})
@@ -329,6 +315,10 @@ def track_trigger_spam(chat_data: dict, user_id: int, phrase: str) -> bool:
     if len(timestamps) > TRIGGER_SPAM_LIMIT:
         ignored = chat_data.setdefault("ignored_until", {})
         ignored[user_id] = now + TRIGGER_SPAM_MUTE
+        if persistence and chat_id:
+            asyncio.create_task(
+                persistence.set_chat_ignored(chat_id, user_id, now + TRIGGER_SPAM_MUTE)
+            )
         return True
     return False
 
@@ -410,28 +400,31 @@ class PiBotMiddleware(BaseMiddleware):
         persistence = self.pibot.persistence
         chat_id = event.chat.id
 
-        if chat_id not in persistence.chat_data:
-            persistence.chat_data[chat_id] = {}
+        chat_data = await persistence.get_chat_data(chat_id)
 
-        chat_data = persistence.chat_data[chat_id]
-        bot_data = persistence.bot_data
-
-        data["chat_data"] = chat_data
-        data["bot_data"] = bot_data
-        data["_persistence"] = persistence
+        self.pibot._chat_transient.setdefault(chat_id, {})
 
         ids = chat_data.setdefault("message_ids", deque())
         ids.append(event.message_id)
         while len(ids) > MAX_TRACKED_MESSAGES:
             ids.popleft()
 
-        known = bot_data.setdefault("known_chats", set())
-        known.add(chat_id)
+        await persistence.add_known_chat(chat_id)
 
         user = event.from_user
         if user and user.username:
-            username_map = bot_data.setdefault("username_map", {})
-            username_map[user.username.lower()] = user.id
+            await persistence.update_username_map(user.username.lower(), user.id)
+
+        bot_data = {
+            "banned_users": list(persistence.banned_users),
+            "known_chats": persistence.known_chats,
+            "username_map": persistence.username_map,
+            "llm_provider": persistence._bot_config.get("llm_provider", ""),
+        }
+
+        data["chat_data"] = chat_data
+        data["bot_data"] = bot_data
+        data["_persistence"] = persistence
 
         if not user or user.is_bot:
             return await handler(event, data)
@@ -443,55 +436,48 @@ class PiBotMiddleware(BaseMiddleware):
                 or str(event.from_user.id)
             )
             history = self.pibot.chat_history.setdefault(chat_id, [])
-            history.append({"username": mention, "text": event.text})
+            history.append({
+                "username": mention,
+                "text": event.text,
+                "message_id": event.message_id,
+            })
             if len(history) > AI_MAX_HISTORY:
                 history[:] = history[-AI_MAX_HISTORY:]
 
         if event.chat.type not in ("group", "supergroup"):
             return await handler(event, data)
 
-        if user.id in bot_data.get("banned_users", []):
+        if user.id in persistence.banned_users:
             return await handler(event, data)
 
         user_rank = await get_user_rank(event.chat, chat_data, user.id)
         if user_rank <= RANK_ADMIN:
             return await handler(event, data)
 
-        if event.text and self.pibot.filters:
-            skip_filter = False
-            if event.date:
-                f_date = event.date
-                if f_date.tzinfo is None:
-                    f_date = f_date.replace(tzinfo=timezone.utc)
-                if (datetime.now(timezone.utc) - f_date).total_seconds() > MAX_MESSAGE_AGE:
-                    skip_filter = True
-            if not skip_filter:
-                text_lower = event.text.lower()
-                for pattern in self.pibot.filters:
-                    if pattern.lower() in text_lower:
-                        logger.info(
-                            "[Filter] удалено сообщение %d от %s (%s) в чате %d: совпадение с \"%s\"",
-                            event.message_id,
-                            user.id,
-                            user.username or user.first_name,
+        if event.text:
+            result = self.pibot.filter_manager.check(
+                event.text, event.date, user.id, chat_id
+            )
+            if result.matched:
+                try:
+                    await event.delete()
+                except Exception as e:
+                    logger.warning("[Filter] не удалось удалить сообщение: %s", e)
+                if result.should_mute:
+                    try:
+                        bot_instance: Bot = data["bot"]
+                        kwargs: dict[str, Any] = {}
+                        if result.mute_until is not None:
+                            kwargs["until_date"] = result.mute_until
+                        await bot_instance.restrict_chat_member(
                             chat_id,
-                            pattern,
+                            user.id,
+                            permissions=NO_PERMISSIONS,
+                            **kwargs,
                         )
-                        try:
-                            await event.delete()
-                        except Exception as e:
-                            logger.warning("[Filter] не удалось удалить сообщение: %s", e)
-                        try:
-                            bot_instance: Bot = data["bot"]
-                            await bot_instance.restrict_chat_member(
-                                chat_id,
-                                user.id,
-                                permissions=NO_PERMISSIONS,
-                                until_date=int(time.time() + FILTER_MUTE_DURATION),
-                            )
-                        except Exception as e:
-                            logger.warning("[Filter] не удалось замутить: %s", e)
-                        return None
+                    except Exception as e:
+                        logger.warning("[Filter] не удалось замутить: %s", e)
+                return None
 
         if event.date:
             msg_date = event.date
@@ -561,9 +547,10 @@ class PiBot:
         self, token: str, groq_key: str = "", openrouter_key: str = ""
     ) -> None:
         self.phrases = load_phrases()
+        self.links = load_links()
         self.rp_commands = load_rp_commands()
         self.dev_ids = load_dev_ids()
-        self.filters = load_filters()
+        self.filter_manager = FilterManager(FILTERS, mute_duration=FILTER_MUTE_DURATION)
 
         self.banned_users: set[int] = set()
 
@@ -578,6 +565,8 @@ class PiBot:
         self.persistence = SQLitePersistence(
             db_path=Path(__file__).parent / "bot_data.db"
         )
+
+        self._chat_transient: dict[int, dict[str, Any]] = {}
 
         self.bot = Bot(
             token=token,
@@ -653,13 +642,13 @@ class PiBot:
             len(enabled),
         )
 
-    def _ensure_ai_provider(self) -> None:
-        name = self.persistence.bot_data.get("llm_provider", "")
+    async def _ensure_ai_provider(self) -> None:
+        name = self.persistence._bot_config.get("llm_provider", "")
         if name in self.providers and self.providers[name].enabled:
             return
         for p in self.providers.values():
             if p.enabled:
-                self.persistence.bot_data["llm_provider"] = p.name
+                await self.persistence.set_bot_config("llm_provider", p.name)
                 break
         else:
             logger.warning("No enabled AI provider available")
@@ -694,13 +683,14 @@ class PiBot:
         self.commands["все чаты"] = CommandConfig(self.handle_all_chats, 0)
         self.commands["ии"] = CommandConfig(self.handle_ai_cmd, 0)
         self.commands["очистка бд"] = CommandConfig(self.handle_clear_db, 0)
-        self.commands["клонируй"] = CommandConfig(self.handle_git_clone, 0)
+        self.commands["клонируй"] = CommandConfig(self.handle_git_clone, 2)
         self.commands["напиши"] = CommandConfig(self.handle_write_cmd, 0)
 
     async def _on_startup(self) -> None:
-        await self.persistence.load_all()
-        self.banned_users = set(self.persistence.bot_data.get("banned_users", []))
-        self._ensure_ai_provider()
+        await self.persistence.init_db()
+        self.banned_users = set(self.persistence.banned_users)
+        await self._ensure_ai_provider()
+        self.persistence.start_periodic_flush()
         bot_user = await self.bot.me()
         self.bot_id = bot_user.id
         self.bot_username = bot_user.username.lower() if bot_user.username else ""
@@ -718,7 +708,7 @@ class PiBot:
         self.start_time = time.time()
 
     async def _on_shutdown(self) -> None:
-        await self.persistence.flush()
+        await self.persistence.close()
         if self._pid_fd is not None:
             release_pid_lock(self._pid_fd)
             self._pid_fd = None
@@ -789,7 +779,8 @@ class PiBot:
             return
         if await self._handle_phrase(message, chat_data, lower_text):
             return
-        await self._handle_ai(message, chat_data, bot_data)
+        if not await self._handle_ai(message, chat_data, bot_data):
+            await self._handle_random_reply(message, chat_data, bot_data)
 
     def _pre_check(self, message: Message, chat_data: dict, bot_data: dict) -> bool:
         if not message.text:
@@ -857,7 +848,7 @@ class PiBot:
         if lower_text not in self.rp_commands:
             return False
 
-        if track_trigger_spam(chat_data, message.from_user.id, lower_text):
+        if track_trigger_spam(chat_data, message.from_user.id, lower_text, self.persistence, message.chat.id):
             await self.safe_reply(message, "Ой всё", disable_notification=True)
             return True
         if not await self.rate_limiter.acquire():
@@ -879,7 +870,7 @@ class PiBot:
         if lower_text not in self.phrases:
             return False
 
-        if track_trigger_spam(chat_data, message.from_user.id, lower_text):
+        if track_trigger_spam(chat_data, message.from_user.id, lower_text, self.persistence, message.chat.id):
             await self.safe_reply(message, "Ой всё", disable_notification=True)
             return True
         if not await self.rate_limiter.acquire():
@@ -887,10 +878,6 @@ class PiBot:
 
         response = self.phrases[lower_text]
         mention = get_mention(message.from_user)
-
-        if response in SPECIAL_RESPONSES:
-            path, fallback = SPECIAL_RESPONSES[response]
-            response = await self._read_text_file_async(path) or fallback
 
         response = response.replace("{mention}", mention)
         await self.safe_reply(message, response, disable_notification=True)
@@ -956,22 +943,22 @@ class PiBot:
 
     async def _handle_ai(
         self, message: Message, chat_data: dict, bot_data: dict
-    ) -> None:
+    ) -> bool:
         provider = self._get_current_provider(bot_data)
         if not provider or not provider.enabled:
             logger.warning("No available AI provider for message handling")
-            return
+            return False
 
         if message.chat.type in ("group", "supergroup"):
             if not await self._is_bot_mentioned(message):
-                return
+                return False
 
         if not await self.ai_limiter.acquire():
             await self.safe_reply(
                 message,
                 "⚠️ Есть такая штука. Лимит вызовов AI API называется. Пока что 2 раза в минуту ",
             )
-            return
+            return True
 
         query = (
             self._strip_mention(message)
@@ -979,7 +966,7 @@ class PiBot:
             else message.text.strip()
         )
         if not query:
-            return
+            return False
 
         ai_messages = self._build_ai_messages(message, query)
 
@@ -1023,7 +1010,7 @@ class PiBot:
                     message,
                     "⚠️ Ты достиг лимита апи, задрот",
                 )
-                return
+                return True
             except Exception as e:
                 duration = round((time.monotonic() - start) * 1000)
                 logger.error("[%s] API error: %s", provider.name, e, exc_info=True)
@@ -1041,9 +1028,9 @@ class PiBot:
                     }
                 )
                 await self.safe_reply(message, "⚠️ Ошибка при обращении к ИИ")
-                return
+                return True
         else:
-            return
+            return True
 
         duration = round((time.monotonic() - start) * 1000)
         answer = ai_response.content
@@ -1070,6 +1057,117 @@ class PiBot:
             history.append({"role": "assistant", "content": answer})
 
         await self.safe_reply(message, answer, disable_notification=True)
+        return True
+
+    async def _handle_random_reply(
+        self, message: Message, chat_data: dict, bot_data: dict
+    ) -> None:
+        if message.chat.type not in ("group", "supergroup"):
+            return
+
+        if random.random() >= RANDOM_REPLY_CHANCE:
+            return
+
+        history = self.chat_history.get(message.chat.id, [])
+        candidates = [
+            entry for entry in history
+            if len(entry["text"]) > MIN_RANDOM_MSG_LENGTH
+            and entry["message_id"] != message.message_id
+        ]
+        if not candidates:
+            return
+
+        provider = self._get_current_provider(bot_data)
+        if not provider or not provider.enabled:
+            return
+
+        if not await self.ai_limiter.acquire():
+            return
+
+        chosen = random.choice(candidates)
+
+        context_lines = [
+            f"@{entry['username']} said: {entry['text']}"
+            for entry in history[-AI_MAX_HISTORY:]
+        ]
+        ai_messages: list[dict[str, str]] = [
+            {"role": "system", "content": self.personality},
+        ]
+        if context_lines:
+            ai_messages.append({
+                "role": "system",
+                "content": "Recent chat history:\n" + "\n".join(context_lines),
+            })
+        ai_messages.append({
+            "role": "user",
+            "content": (
+                f"Someone wrote in chat:\n"
+                f"@{chosen['username']}: {chosen['text']}\n\n"
+                f"Write a short relevant reply to this message as if you're a "
+                f"chat participant. Keep it concise and natural."
+            ),
+        })
+
+        start = time.monotonic()
+        for attempt in range(AI_RETRY_MAX_ATTEMPTS):
+            try:
+                ai_response = await provider.generate(ai_messages)
+                break
+            except RateLimitError:
+                if attempt < AI_RETRY_MAX_ATTEMPTS - 1:
+                    delay = AI_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        "[%s] 429 Rate Limit random reply (attempt %d/%d). Retrying in %.1fs...",
+                        provider.name,
+                        attempt + 1,
+                        AI_RETRY_MAX_ATTEMPTS,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning(
+                    "[%s] 429 Rate Limit random reply after %d attempts",
+                    provider.name,
+                    AI_RETRY_MAX_ATTEMPTS,
+                )
+                return
+            except Exception as e:
+                logger.error(
+                    "[%s] API error random reply: %s", provider.name, e, exc_info=True
+                )
+                return
+        else:
+            return
+
+        duration = round((time.monotonic() - start) * 1000)
+        answer = ai_response.content
+
+        await self.telemetry.record(
+            {
+                "user_id": message.from_user.id,
+                "username": message.from_user.username,
+                "chat_id": message.chat.id,
+                "chat_type": message.chat.type,
+                "provider": provider.name,
+                "model": ai_response.model,
+                "success": True,
+                "duration_ms": duration,
+                "prompt_tokens": ai_response.prompt_tokens,
+                "completion_tokens": ai_response.completion_tokens,
+                "total_tokens": ai_response.total_tokens,
+                "random_reply": True,
+            }
+        )
+
+        try:
+            await self.bot.send_message(
+                chat_id=message.chat.id,
+                text=answer,
+                reply_to_message_id=chosen["message_id"],
+                disable_notification=True,
+            )
+        except Exception as e:
+            logger.warning("[random_reply] Failed to send message: %s", e)
 
     async def handle_nuke(
         self,
@@ -1186,8 +1284,8 @@ class PiBot:
             await message.bot.ban_chat_member(
                 message.chat.id, target.id, revoke_messages=True
             )
+            await self.persistence.add_global_ban(target.id)
             self.banned_users.add(target.id)
-            bot_data["banned_users"] = list(self.banned_users)
             await self.safe_reply(message, f"✅️ {get_mention(target)} был ликвидирован")
         except Exception as e:
             await self.safe_reply(message, f"⚠️ Ошибка ликвидации: {e}")
@@ -1211,8 +1309,8 @@ class PiBot:
             await message.bot.unban_chat_member(
                 message.chat.id, target.id, only_if_banned=True
             )
+            await self.persistence.remove_global_ban(target.id)
             self.banned_users.discard(target.id)
-            bot_data["banned_users"] = list(self.banned_users)
             await self.safe_reply(message, f"✅️ {get_mention(target)} воскрес")
         except Exception as e:
             await self.safe_reply(message, f"⚠️ Ошибка воскрешения: {e}")
@@ -1241,8 +1339,8 @@ class PiBot:
                 await self.safe_reply(message, "⚠️ Укажи числовой ID или @username")
                 return
 
+        await self.persistence.add_global_ban(target_id)
         self.banned_users.add(target_id)
-        bot_data["banned_users"] = list(self.banned_users)
         await self.safe_reply(message, f"✅️ Пользователь {target_id} заблокирован")
 
     async def handle_unblock(
@@ -1276,7 +1374,7 @@ class PiBot:
             return
 
         self.banned_users.discard(target_id)
-        bot_data["banned_users"] = list(self.banned_users)
+        await self.persistence.remove_global_ban(target_id)
         await self.safe_reply(message, f"✅️ Пользователь {target_id} разблокирован")
 
     async def handle_mute(
@@ -1446,6 +1544,7 @@ class PiBot:
 
         ranks = chat_data.setdefault("ranks", {})
         ranks[target.id] = new_rank
+        await self.persistence.set_chat_rank(message.chat.id, target.id, new_rank)
 
         rank_names = {
             RANK_ADMIN_PLUS: "Админ+",
@@ -1464,10 +1563,11 @@ class PiBot:
         bot_data: dict,
         params: str,
     ) -> None:
-        text = await self._read_text_file_async(BOTINFO_PATH)
-        if not text:
-            text = "⚠️ Инфа потерялась, проверь путь к моему описанию"
-        await self.safe_reply(message, text)
+        link = self.links.get("био")
+        if link:
+            await self.safe_reply(message, link)
+        else:
+            await self.safe_reply(message, "⚠️ Ссылка не настроена")
 
     async def handle_changelog_cmd(
         self,
@@ -1476,10 +1576,11 @@ class PiBot:
         bot_data: dict,
         params: str,
     ) -> None:
-        text = await self._read_text_file_async(CHANGELOG_PATH)
-        if not text:
-            text = "⚠️ Инфа потерялась, проверь путь к моим обновам"
-        await self.safe_reply(message, text)
+        link = self.links.get("обновы")
+        if link:
+            await self.safe_reply(message, link)
+        else:
+            await self.safe_reply(message, "⚠️ Ссылка не настроена")
 
     async def handle_commands_cmd(
         self,
@@ -1488,10 +1589,11 @@ class PiBot:
         bot_data: dict,
         params: str,
     ) -> None:
-        text = await self._read_text_file_async(COMMANDLIST_PATH)
-        if not text:
-            text = "⚠️ Инфа потерялась, проверь путь к списку команд"
-        await self.safe_reply(message, text)
+        link = self.links.get("команды")
+        if link:
+            await self.safe_reply(message, link)
+        else:
+            await self.safe_reply(message, "⚠️ Ссылка не настроена")
 
     async def handle_devcommands_cmd(
         self,
@@ -1500,10 +1602,11 @@ class PiBot:
         bot_data: dict,
         params: str,
     ) -> None:
-        text = await self._read_text_file_async(DEVCOMMANDS_PATH)
-        if not text:
-            text = "⚠️ Инфа потерялась, проверь путь к списку дев команд"
-        await self.safe_reply(message, text)
+        link = self.links.get("дев команды")
+        if link:
+            await self.safe_reply(message, link)
+        else:
+            await self.safe_reply(message, "⚠️ Ссылка не настроена")
 
     async def handle_rank_list(
         self,
@@ -1541,12 +1644,8 @@ class PiBot:
     ) -> None:
         try:
             await self.persistence.clear_all()
-
-            bot_data.clear()
-            bot_data["known_chats"] = set()
-            bot_data["username_map"] = {}
-
-            self.msg_locks.clear()
+            self.banned_users.clear()
+            self._chat_transient.clear()
 
             await self.safe_reply(message, "✅ База данных очищена")
         except Exception as e:
@@ -1662,7 +1761,7 @@ class PiBot:
         bot_data: dict,
         params: str,
     ) -> None:
-        known = bot_data.get("known_chats", set())
+        known = self.persistence.known_chats
         if not known:
             await self.safe_reply(message, "Нет известных чатов")
             return
@@ -1717,7 +1816,7 @@ class PiBot:
         )
         await self.safe_reply(
             message,
-            f"🎛 Текущий AI бэкенд: {current_name}",
+            f"🎛 Текущий AI провайдер: {current_name}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
 
@@ -1740,8 +1839,7 @@ class PiBot:
             await callback.answer("⚠️ Провайдер недоступен", show_alert=True)
             return
 
-        self.persistence.bot_data["llm_provider"] = provider_name
-        await self.persistence.flush()
+        await self.persistence.set_bot_config("llm_provider", provider_name)
 
         await callback.message.edit_text(
             f"✅ AI бэкенд переключён на {self.providers[provider_name].display_name}"
@@ -1761,7 +1859,7 @@ class PiBot:
             )
             return
 
-        known = bot_data.get("known_chats", set())
+        known = self.persistence.known_chats
         if not known:
             await self.safe_reply(message, "Нет известных чатов")
             return
@@ -1819,7 +1917,7 @@ class PiBot:
             await callback.answer(f"❌ Не удалось отправить: {e}", show_alert=True)
 
     async def _cleanup_caches(self) -> None:
-        known = self.persistence.bot_data.get("known_chats", set())
+        known = self.persistence.known_chats
         now = time.time()
 
         for cid in list(self.msg_locks):
@@ -1830,10 +1928,12 @@ class PiBot:
             if cid not in known:
                 del self.bot_message_ids[cid]
 
-        for chat_id, chat_data in list(self.persistence.chat_data.items()):
+        for chat_id in list(self.persistence._chat_data_cache.keys()):
             if chat_id not in known:
-                self.persistence.chat_data[chat_id] = {}
+                del self.persistence._chat_data_cache[chat_id]
                 continue
+
+            chat_data = self.persistence._chat_data_cache[chat_id]
 
             trigger_spam = chat_data.get("trigger_spam")
             if trigger_spam:

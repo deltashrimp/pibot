@@ -1,6 +1,4 @@
 {
   "привет": "Привет {mention}!",
-
-  "hello": "Hello {mention}!",
-  "hi": "Hi {mention}!"
+  "hello": "Hello {mention}!"
 }

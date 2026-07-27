@@ -35,7 +35,7 @@ pibot/
 
 1. Clone the repository to your server
 2. Run `bash setup.sh` — creates config files, venv, and installs dependencies
-3. Fill in `.env` with your bot token and Groq API key (TELEGRAM_TOKEN, GROQ_KEY)
+3. Fill in `.env` with your bot token and API keys (TELEGRAM_TOKEN, GROQ_KEY)
 4. Optionally edit `bot-data/personality.md` and `bot-data/botinfo.md`
 5. Run `./launchbot.sh`
 
