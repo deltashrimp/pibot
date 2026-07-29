@@ -31,9 +31,9 @@ from aiogram.types import (
     User,
 )
 from dotenv import load_dotenv
-from groq import AsyncGroq, RateLimitError
+from groq import AsyncGroq, RateLimitError as GroqRateLimitError
 from logging_settings import setup_logging
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError as OpenAIRateLimitError
 from persistence import SQLitePersistence
 from filtering import FilterManager, FILTERS
 from telemetry import Telemetry
@@ -256,7 +256,6 @@ class AIBackend:
             self.name,
             AI_RETRY_MAX_ATTEMPTS,
             last_error,
-            exc_info=True,
         )
         raise last_error  # type: ignore[misc]
 
@@ -617,7 +616,7 @@ class PiBot:
             display_name="Groq",
             client=groq_client,
             model=GROQ_MODEL,
-            rate_limit_error=RateLimitError,
+            rate_limit_error=GroqRateLimitError,
         )
 
         or_client = (
@@ -633,6 +632,7 @@ class PiBot:
             display_name="OpenRouter",
             client=or_client,
             model=OPENROUTER_MODEL,
+            rate_limit_error=OpenAIRateLimitError,
         )
 
         enabled = [p for p in self.providers.values() if p.enabled]
@@ -958,7 +958,7 @@ class PiBot:
         if not await self.ai_limiter.acquire():
             await self.safe_reply(
                 message,
-                "⚠️ Есть такая штука. Лимит вызовов AI API называется. Пока что 2 раза в минуту ",
+                "⚠️ Лимит апиииииии. Жди минуту ",
             )
             return True
 
@@ -977,7 +977,7 @@ class PiBot:
             try:
                 ai_response = await provider.generate(ai_messages)
                 break
-            except RateLimitError:
+            except (GroqRateLimitError, OpenAIRateLimitError):
                 if attempt < AI_RETRY_MAX_ATTEMPTS - 1:
                     delay = AI_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1)
                     logger.warning(
@@ -1073,7 +1073,7 @@ class PiBot:
         history = self.chat_history.get(message.chat.id, [])
         replied = self.replied_to_ids.setdefault(message.chat.id, set())
         candidates = [
-            entry for entry in history
+            entry for entry in history[-AI_MAX_HISTORY:]
             if len(entry["text"]) > MIN_RANDOM_MSG_LENGTH
             and entry["message_id"] != message.message_id
             and entry["message_id"] not in replied
@@ -1117,7 +1117,7 @@ class PiBot:
             try:
                 ai_response = await provider.generate(ai_messages)
                 break
-            except RateLimitError:
+            except (GroqRateLimitError, OpenAIRateLimitError):
                 if attempt < AI_RETRY_MAX_ATTEMPTS - 1:
                     delay = AI_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1)
                     logger.warning(
@@ -1847,7 +1847,7 @@ class PiBot:
         await self.persistence.set_bot_config("llm_provider", provider_name)
 
         await callback.message.edit_text(
-            f"✅ AI бэкенд переключён на {self.providers[provider_name].display_name}"
+            f"✅ AI провайдер переключён на {self.providers[provider_name].display_name}"
         )
         await callback.answer()
 
