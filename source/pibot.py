@@ -52,7 +52,7 @@ AI_MAX_HISTORY = 20
 AI_RETRY_MAX_ATTEMPTS = 3
 AI_RETRY_BASE_DELAY = 1.0
 GROQ_MODEL = "llama-3.3-70b-versatile"
-OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+OPENROUTER_MODEL = "poolside/laguna-s-2.1:free" # openai/gpt-oss-20b:free
 
 PID_FILE = BASE / "pibot.pid"
 
