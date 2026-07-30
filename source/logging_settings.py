@@ -5,6 +5,8 @@ from pathlib import Path
 
 from colorama import Back, Fore, Style
 
+# Кодом великодушно поделился рамзес666
+
 COLORS = {
     "DEBUG": Fore.CYAN,
     "INFO": Fore.GREEN,

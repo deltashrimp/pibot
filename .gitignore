@@ -7,13 +7,10 @@ __pycache__/
 .env
 
 # Sensitive config
-env/
-source/bot_data.pickle
 .mypy_cache/
 
 # Runtime data (contains chat/user data)
 source/bot_data.db
-bot_data.db
 
 # PID lock file (prevents multiple instances)
 pibot.pid
@@ -29,8 +26,5 @@ telemetry.json
 isthisalis-home-adress.md
 sex-with-ramses666.mp4
 **/opencode/
-info/command-list.md
-
 bot-data/phrases.json
 bot-data/personality.md
-bot-data/dev-commands.md

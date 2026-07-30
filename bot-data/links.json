@@ -1,6 +1,7 @@
 {
-  "био": "linktopost",
-  "команды": "linktopost",
-  "дев команды": "linktopost",
-  "обновы": "linktopost"
+  "био": "teletype.in/@pibot_news/meet_the_pibot",
+  "команды": "teletype.in/@pibot_news/pibot_commands",
+  "дев команды": "teletype.in/@pibot_news/dev_comands",
+  "обновы": "Разрабу ща лень делать ченджлог. Смотри гитхаб, там вроде был. (Пибот гитхаб)",
+  "гитхаб": "github.com/deltashrimp/pibot"
 }

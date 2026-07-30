@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, MessageEntityType, ParseMode
+from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
     Chat,
@@ -36,6 +37,8 @@ from logging_settings import setup_logging
 from openai import AsyncOpenAI, RateLimitError as OpenAIRateLimitError
 from persistence import SQLitePersistence
 from filtering import FilterManager, FILTERS
+from greeter import cmd_start
+from anti_raid import handle_raid_protection, on_chat_member
 from telemetry import Telemetry
 
 logger = logging.getLogger(__name__)
@@ -52,7 +55,7 @@ AI_MAX_HISTORY = 20
 AI_RETRY_MAX_ATTEMPTS = 3
 AI_RETRY_BASE_DELAY = 1.0
 GROQ_MODEL = "llama-3.3-70b-versatile"
-OPENROUTER_MODEL = "poolside/laguna-s-2.1:free" # openai/gpt-oss-20b:free
+OPENROUTER_MODEL = "poolside/laguna-s-2.1:free" # Чатгпт бесплатный - openai/gpt-oss-20b:free
 
 PID_FILE = BASE / "pibot.pid"
 
@@ -70,8 +73,8 @@ ANTISPAM_MAX_MESSAGE_AGE = 180  # 3 minutes
 FILTER_MUTE_DURATION = 60
 PIBOT_PREFIX = "пибот "
 PIBOT_PREFIX_LEN = len(PIBOT_PREFIX)
-RANDOM_REPLY_CHANCE = 0.30
-MIN_RANDOM_MSG_LENGTH = 30
+RANDOM_REPLY_CHANCE = 0.05 # Шанс рандомного ответа 5%
+MIN_RANDOM_MSG_LENGTH = 30 # Минимальная длина сообщения, чтобы оно попало в пул для ответов
 
 RANK_OWNER = 1
 RANK_ADMIN_PLUS = 2
@@ -419,6 +422,7 @@ class PiBotMiddleware(BaseMiddleware):
             "known_chats": persistence.known_chats,
             "username_map": persistence.username_map,
             "llm_provider": persistence._bot_config.get("llm_provider", ""),
+            "persistence": persistence,
         }
 
         data["chat_data"] = chat_data
@@ -570,7 +574,7 @@ class PiBot:
 
         self.bot = Bot(
             token=token,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+            default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2),
         )
         self.dp = Dispatcher()
 
@@ -582,7 +586,9 @@ class PiBot:
         self.dp.startup.register(self._on_startup)
         self.dp.shutdown.register(self._on_shutdown)
 
+        self.dp.message(Command("start"))(cmd_start)
         self.dp.message()(self.handle_message)
+        self.dp.chat_member()(on_chat_member)
         self.dp.callback_query(lambda c: c.data and c.data.startswith("aichange:"))(
             self._handle_ai_change
         )
@@ -686,6 +692,7 @@ class PiBot:
         self.commands["очистка бд"] = CommandConfig(self.handle_clear_db, 0)
         self.commands["клонируй"] = CommandConfig(self.handle_git_clone, 2)
         self.commands["напиши"] = CommandConfig(self.handle_write_cmd, 0)
+        self.commands["защита"] = CommandConfig(handle_raid_protection, 2)
 
     async def _on_startup(self) -> None:
         await self.persistence.init_db()
@@ -728,7 +735,7 @@ class PiBot:
             self.dp.start_polling(
                 self.bot,
                 timeout=60,
-                allowed_updates=["message", "callback_query"],
+                allowed_updates=["message", "callback_query", "chat_member"],
             )
         )
 
