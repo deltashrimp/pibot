@@ -574,7 +574,7 @@ class PiBot:
 
         self.bot = Bot(
             token=token,
-            default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2),
+            default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
         )
         self.dp = Dispatcher()
 

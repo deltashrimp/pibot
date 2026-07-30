@@ -66,7 +66,7 @@ def setup_logging(
 
     logger.addHandler(console_handler)
 
-    logger.setLevel(logging.DEBUG)
+    # logger.setLevel(logging.DEBUG)
 
     if file_path is not None:
         file_handler = logging.FileHandler(file_path, encoding="utf-8")
