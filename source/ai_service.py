@@ -16,6 +16,7 @@ from openai import RateLimitError as OpenAIRateLimitError
 
 from constants import (
     AI_MAX_HISTORY,
+    AI_PROVIDER_OFF,
     AI_RETRY_BASE_DELAY,
     AI_RETRY_MAX_ATTEMPTS,
     GROUP_HISTORY_MAX,
@@ -255,6 +256,8 @@ class AIService:
     async def ensure_provider(self) -> None:
         """Persist the first enabled provider as the current one, if unset."""
         name = await self.pibot.persistence.get_bot_config("llm_provider", "")
+        if name == AI_PROVIDER_OFF:
+            return
         if name in self.providers and self.providers[name].enabled:
             return
         for p in self.providers.values():
@@ -267,6 +270,8 @@ class AIService:
     def get_current_provider(self, bot_data: dict) -> AIBackend | None:
         """Return the configured/available provider, or None."""
         name = bot_data.get("llm_provider", "")
+        if name == AI_PROVIDER_OFF:
+            return None
         provider = self.providers.get(name)
         if provider and provider.enabled:
             return provider

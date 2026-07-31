@@ -27,6 +27,7 @@ from aiogram.types import (
 
 from chat_service import get_user_rank, resolve_user, target_immune_to_mkb
 from constants import (
+    AI_PROVIDER_OFF,
     DELETE_BATCH_SIZE,
     MAX_COMMAND_ARG_LENGTH,
     MAX_TRACKED_MESSAGES,
@@ -888,11 +889,22 @@ class CommandRouter:
             await self.pibot.safe_reply(message, "⚠️ Нет доступных AI провайдеров")
             return
 
-        current_name = (
-            self.pibot.ai_service.providers[current].display_name
-            if current in self.pibot.ai_service.providers
-            else "—"
+        off_label = f"{'✅ ' if current == AI_PROVIDER_OFF else ''}Выключить ИИ"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=off_label,
+                    callback_data=f"aichange:{user.id}:{AI_PROVIDER_OFF}",
+                )
+            ]
         )
+
+        if current == AI_PROVIDER_OFF:
+            current_name = "Выключено"
+        elif current in self.pibot.ai_service.providers:
+            current_name = self.pibot.ai_service.providers[current].display_name
+        else:
+            current_name = "—"
         await self.pibot.safe_reply(
             message,
             f"🎛 Текущий AI провайдер: {current_name}",
@@ -912,6 +924,15 @@ class CommandRouter:
             return
         if callback.from_user.id != caller_id:
             await callback.answer("⛔️ Это не твоя кнопка", show_alert=True)
+            return
+        if provider_name == AI_PROVIDER_OFF:
+            await self.pibot.persistence.set_bot_config(
+                "llm_provider", AI_PROVIDER_OFF
+            )
+            msg = callback.message
+            if isinstance(msg, Message):
+                await msg.edit_text("✅ ИИ выключен")
+            await callback.answer()
             return
         if (
             provider_name not in self.pibot.ai_service.providers
