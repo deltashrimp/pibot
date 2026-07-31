@@ -1,7 +1,10 @@
+import json
 import logging
 import sys
 import traceback
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from colorama import Back, Fore, Style
 
@@ -52,6 +55,31 @@ file_formatter = logging.Formatter(
 )
 
 
+class JsonFormatter(logging.Formatter):
+    """Structured JSON log lines for the file handler (machine-readable)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry: dict[str, Any] = {
+            "ts": datetime.fromtimestamp(record.created).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "level": record.levelname,
+            "logger": record.name,
+            "module": record.module,
+            "line": record.lineno,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            entry["exc"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            entry["stack"] = self.formatStack(record.stack_info)
+        for key in ("user_id", "chat_id", "provider", "duration_ms"):
+            value = getattr(record, key, None)
+            if value is not None:
+                entry[key] = value
+        return json.dumps(entry, ensure_ascii=False)
+
+
 # основная функция
 def setup_logging(
     console_log_level: int,
@@ -70,8 +98,9 @@ def setup_logging(
 
     if file_path is not None:
         file_handler = logging.FileHandler(file_path, encoding="utf-8")
-        file_handler.setLevel(file_log_level)
-        file_handler.setFormatter(file_formatter)
+        if file_log_level is not None:
+            file_handler.setLevel(file_log_level)
+        file_handler.setFormatter(JsonFormatter())
 
         logger.addHandler(file_handler)
 

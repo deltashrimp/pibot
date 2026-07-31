@@ -42,23 +42,21 @@ async def handle_raid_protection(
         return
 
     chat_id = message.chat.id
+    bot = message.bot
+    assert bot is not None
     enabled = await get_protection_state(persistence, chat_id)
 
     if enabled:
         await set_protection_state(persistence, chat_id, False)
         try:
-            await message.bot(
-                SetChatSlowModeDelay(chat_id=chat_id, slow_mode_delay=0)
-            )
+            await bot(SetChatSlowModeDelay(chat_id=chat_id, slow_mode_delay=0))
         except Exception as e:
             logger.warning("[AntiRaid] Failed to reset slow mode: %s", e)
         await message.answer("Защита выключена")
     else:
         await set_protection_state(persistence, chat_id, True)
         try:
-            await message.bot(
-                SetChatSlowModeDelay(chat_id=chat_id, slow_mode_delay=300)
-            )
+            await bot(SetChatSlowModeDelay(chat_id=chat_id, slow_mode_delay=300))
         except Exception as e:
             logger.warning("[AntiRaid] Failed to set slow mode: %s", e)
         await message.answer("Чат под защитой")
@@ -82,9 +80,11 @@ async def on_chat_member(
     if was_not_member and is_now_member:
         user = update.new_chat_member.user
         if user and not user.is_bot:
+            bot = update.bot
+            assert bot is not None
             try:
-                await update.bot.ban_chat_member(chat_id, user.id)
-                await update.bot.unban_chat_member(chat_id, user.id)
+                await bot.ban_chat_member(chat_id, user.id)
+                await bot.unban_chat_member(chat_id, user.id)
                 logger.info(
                     "[AntiRaid] Kicked %d from %d (raid protection)",
                     user.id,
